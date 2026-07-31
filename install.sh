@@ -82,10 +82,33 @@ clone_or_update_repo(){
   if [[ -d "${INSTALL_DIR}/.git" ]]; then
     info "Project already exists, updating..."
     git -C "${INSTALL_DIR}" pull
-  else
-    info "Cloning project from GitHub..."
-    mkdir -p "${INSTALL_DIR}"
-    git clone "${REPO_URL}" "${INSTALL_DIR}"
+    ok "Project code is ready."
+    return
+  fi
+
+  # INSTALL_DIR may already exist and be non-empty from a previous failed/
+  # partial run (it isn't a git checkout, so we can't just "pull") - git
+  # clone refuses to clone into a non-empty directory, so clear it first.
+  # Keep a previously-generated .env around if one is there.
+  local env_backup=""
+  if [[ -d "${INSTALL_DIR}" ]] && [[ -n "$(ls -A "${INSTALL_DIR}" 2>/dev/null)" ]]; then
+    warn "${INSTALL_DIR} already exists (from a previous run) but isn't a git checkout - clearing it first."
+    if [[ -f "${INSTALL_DIR}/.env" ]]; then
+      env_backup=$(mktemp)
+      cp "${INSTALL_DIR}/.env" "$env_backup"
+    fi
+    # Fully removed (not recreated) - git clone needs a nonexistent or
+    # empty target directory, so we let git clone create it fresh below.
+    rm -rf "${INSTALL_DIR:?}"
+  fi
+
+  info "Cloning project from GitHub..."
+  mkdir -p "$(dirname "${INSTALL_DIR}")"
+  git clone "${REPO_URL}" "${INSTALL_DIR}"
+
+  if [[ -n "$env_backup" ]]; then
+    mv "$env_backup" "${INSTALL_DIR}/.env"
+    info "Restored previous .env file."
   fi
   ok "Project code is ready."
 }
