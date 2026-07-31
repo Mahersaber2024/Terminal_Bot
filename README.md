@@ -5,25 +5,33 @@ Telegram bot that lets each user register their own server(s) and run SSH comman
 ## Install
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Mahersaber2024/Terminal_Bot/main/install.sh) -r https://github.com/Mahersaber2024/Terminal_Bot.git
+bash <(curl -fsSL https://raw.githubusercontent.com/Mahersaber2024/Terminal_Bot/main/install.sh)
 ```
 
-> The `-r` flag is required in this one-liner form — since only `install.sh` itself is piped into `bash`, the script doesn't have the rest of the project locally and needs the repo URL to `git clone` it.
->
 > Run this as the `root` user (the default on most fresh VPS instances). If you're logged in as a non-root user, prefix it with `sudo`:
 > ```bash
-> sudo bash <(curl -fsSL https://raw.githubusercontent.com/Mahersaber2024/Terminal_Bot/main/install.sh) -r https://github.com/Mahersaber2024/Terminal_Bot.git
+> sudo bash <(curl -fsSL https://raw.githubusercontent.com/Mahersaber2024/Terminal_Bot/main/install.sh)
 > ```
 
-Prompts for bot token, admin IDs, and optional sponsor-channel gate, then sets up a venv and a systemd service.
+This opens an interactive menu:
 
-Installs by default to `/opt/terminal-bot`. To use a different directory, pass `-d` (combine with `-r` if using the curl one-liner):
-
-```bash
-sudo bash install.sh -d /path/to/your/dir
-# or, via the curl one-liner:
-bash <(curl -fsSL https://raw.githubusercontent.com/Mahersaber2024/Terminal_Bot/main/install.sh) -r https://github.com/Mahersaber2024/Terminal_Bot.git -d /path/to/your/dir
 ```
+======================================
+ 🚀 Terminal Bot - Installer
+======================================
+1) Full installation
+2) Update bot
+3) Restart service
+4) View logs
+5) Service status
+6) Complete uninstall
+0) Exit
+======================================
+```
+
+Choose **1) Full installation** the first time. It clones the project itself, asks for the install path (default `/opt/terminal-bot`), prompts for bot token, admin IDs, and optional sponsor-channel gate, then sets up a venv and a systemd service.
+
+Run the same one-liner again any time to update, restart, check status, view logs, or uninstall — just pick the matching menu option.
 
 You can still clone the repo and run it locally instead:
 
@@ -31,12 +39,6 @@ You can still clone the repo and run it locally instead:
 git clone https://github.com/Mahersaber2024/Terminal_Bot.git
 cd Terminal_Bot
 sudo bash install.sh
-```
-
-## Uninstall
-
-```bash
-sudo bash uninstall.sh
 ```
 
 ## Service
@@ -50,6 +52,8 @@ systemctl restart terminal-bot
 systemctl status terminal-bot
 journalctl -u terminal-bot -f
 ```
+
+(Or use the installer's own menu — options 3–6 wrap these same actions.)
 
 ## Features
 
