@@ -28,7 +28,9 @@ This opens an interactive menu:
 0) Exit
 ======================================
 ```
-
+```
+install path (default: /opt/terminal-bot
+```
 Choose **1) Full installation** the first time. It clones the project itself, asks for the install path (default `/opt/terminal-bot`), prompts for bot token, admin IDs, and optional sponsor-channel gate, then sets up a venv and a systemd service.
 
 Run the same one-liner again any time to update, restart, check status, view logs, or uninstall — just pick the matching menu option.
