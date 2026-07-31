@@ -12,7 +12,6 @@ DEFAULT_INSTALL_DIR="/opt/terminal-bot"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 STATE_FILE="/etc/${SERVICE_NAME}.install_dir"
 
-# فایل‌های سورس ضروری که باید در ریشه‌ی ریپو موجود باشند
 REQUIRED_FILES=(
   "main.py"
   "handlers.py"
@@ -22,7 +21,6 @@ REQUIRED_FILES=(
   "requirements.txt"
 )
 
-# فایل‌هایی که به‌صورت پکیج داخل پوشه‌ی ServerManager/ قرار دارند
 SERVERMANAGER_REQUIRED_FILES=(
   "__init__.py"
   "server_manager_handlers.py"
@@ -86,10 +84,6 @@ clone_or_update_repo(){
     return
   fi
 
-  # INSTALL_DIR may already exist and be non-empty from a previous failed/
-  # partial run (it isn't a git checkout, so we can't just "pull") - git
-  # clone refuses to clone into a non-empty directory, so clear it first.
-  # Keep a previously-generated .env around if one is there.
   local env_backup=""
   if [[ -d "${INSTALL_DIR}" ]] && [[ -n "$(ls -A "${INSTALL_DIR}" 2>/dev/null)" ]]; then
     warn "${INSTALL_DIR} already exists (from a previous run) but isn't a git checkout - clearing it first."
@@ -132,9 +126,6 @@ verify_required_files(){
     exit 1
   fi
 
-  # اگر __init__.py در گیت commit نشده باشد (فایل‌های خالی گاهی از قلم
-  # می‌افتند)، خودمان می‌سازیمش تا ایمپورت «from ServerManager import ...»
-  # با ModuleNotFoundError شکست نخورد.
   if [[ ! -f "${INSTALL_DIR}/ServerManager/__init__.py" ]]; then
     warn "ServerManager/__init__.py not found — creating an empty one so 'ServerManager' is importable as a package."
     touch "${INSTALL_DIR}/ServerManager/__init__.py"
