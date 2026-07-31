@@ -5,9 +5,29 @@ Telegram bot that lets each user register their own server(s) and run SSH comman
 ## Install
 
 ```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Mahersaber2024/Terminal_Bot/main/install.sh)
+```
+
+> Run this as the `root` user (the default on most fresh VPS instances). If you're logged in as a non-root user, prefix it with `sudo`:
+> ```bash
+> sudo bash <(curl -fsSL https://raw.githubusercontent.com/Mahersaber2024/Terminal_Bot/main/install.sh)
+> ```
+
+Prompts for bot token, admin IDs, and optional sponsor-channel gate, then sets up a venv and a systemd service.
+
+Installs by default to `/opt/terminal-bot`. To use a different directory, pass `-d`:
+
+```bash
+sudo bash install.sh -d /path/to/your/dir
+```
+
+You can still clone the repo and run it locally instead:
+
+```bash
+git clone https://github.com/Mahersaber2024/Terminal_Bot.git
+cd Terminal_Bot
 sudo bash install.sh
 ```
-Prompts for bot token, admin IDs, and optional sponsor-channel gate, then sets up a venv and a systemd service.
 
 ## Uninstall
 
