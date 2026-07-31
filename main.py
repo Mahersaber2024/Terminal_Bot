@@ -1,15 +1,3 @@
-"""
-Terminal Bot - main entry point
-==================================
-A standalone Telegram bot: users register their own server(s) and run SSH
-commands on them through a live, interactive terminal in the chat. Access
-is gated behind joining the configured sponsor channel(s) (see config.py).
-
-Run:
-    pip install -r requirements.txt
-    cp .env.example .env      # fill in BOT_TOKEN, ADMIN_IDS, SPONSOR_CHANNELS
-    python main.py
-"""
 import logging
 import os
 import sys
