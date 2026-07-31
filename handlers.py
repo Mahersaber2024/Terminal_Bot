@@ -1,11 +1,3 @@
-"""
-handlers.py
-===========
-Core, non-Server-Manager command handlers: /start, /help, and the shared
-main reply-keyboard menu. ServerManager.server_manager_handlers calls
-get_main_menu() (wired up via set_get_main_menu in main.py) whenever it
-needs to send the user "back" to this same keyboard.
-"""
 from telegram import ReplyKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
