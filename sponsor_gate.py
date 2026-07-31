@@ -1,25 +1,4 @@
-"""
-sponsor_gate.py
-================
-Gates every update (messages and button taps alike) behind membership in
-the sponsor channel(s) configured in config.SPONSOR_CHANNELS.
-
-How it's wired (see main.py):
-    application.add_handler(MessageHandler(filters.ALL, sponsor_gate.gate), group=-1)
-    application.add_handler(CallbackQueryHandler(sponsor_gate.gate), group=-1)
-
-group=-1 runs before every other handler. gate() checks the user's
-membership in each required channel; if any is missing it shows a "join
-these channels" prompt with a "✅ I've joined" button and raises
-ApplicationHandlerStop so nothing else in the update pipeline runs for
-this update. Once every channel check passes, gate() does nothing and lets
-the update fall through to the normal handlers (/start, Server Manager, etc).
-
-If config.SPONSOR_CHANNELS is empty, gate() is a no-op - the bot is open
-to everyone, matching main.py's startup message.
-"""
 import logging
-
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError
 from telegram.ext import ApplicationHandlerStop, ContextTypes
