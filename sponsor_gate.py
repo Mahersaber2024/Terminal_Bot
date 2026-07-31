@@ -28,9 +28,6 @@ async def _is_member(bot, channel_id, user_id) -> bool:
         member = await bot.get_chat_member(chat_id=channel_id, user_id=user_id)
         return member.status in _JOINED_STATUSES
     except TelegramError as e:
-        # Most common cause: the bot isn't an admin in the channel, or the
-        # user has never interacted with it. Fail closed (treat as "not
-        # joined") but log it so the misconfiguration is easy to spot.
         logger.warning(f"Sponsor check failed for channel {channel_id}: {e}")
         return False
 
@@ -104,8 +101,5 @@ async def sponsor_check_callback(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text("✅ Membership confirmed - you're all set!")
     except TelegramError:
         pass
-
-    # Send a fresh /start so the user immediately sees the main menu instead
-    # of having to type /start themselves.
     import handlers
     await handlers.start(update, context)
