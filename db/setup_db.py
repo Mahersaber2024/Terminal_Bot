@@ -1,19 +1,30 @@
 """
-setup_db.py
-===========
+db/setup_db.py
+===============
 Run this once (and again after pulling updates that add new tables) to
 create/verify the PostgreSQL schema used by Terminal Bot. Reads connection
-settings from .env via config.py (DB_HOST, DB_PORT, DB_NAME, DB_USER,
-DB_PASSWORD) - see config.py for the full list. (Database settings used to
-live in a separate db/config.py - that file has been merged into the
-top-level config.py, so there's now a single config file for the whole
+settings from .env via the repo-root config.py (DB_HOST, DB_PORT, DB_NAME,
+DB_USER, DB_PASSWORD) - see config.py for the full list. (Database settings
+used to live in a separate db/config.py - that file has been merged into
+the top-level config.py, so there's now a single config file for the whole
 project.)
 
+This file lives inside db/, one level below config.py, so "import config"
+below needs the repo root on sys.path - Python only puts the *script's own*
+directory (db/) there automatically, not the repo root, so without the
+sys.path.insert() below "import config" would fail with ModuleNotFoundError
+whenever this is run directly (e.g. "python3 db/setup_db.py"). The insert
+makes it work no matter how it's invoked - as a direct script, via
+"python3 -m db.setup_db", or from any working directory.
+
 Usage:
-    python3 setup_db.py            # interactive
-    python3 setup_db.py --auto     # skip the closing prompt (used by install.sh)
+    python3 db/setup_db.py            # interactive
+    python3 db/setup_db.py --auto     # skip the closing prompt (used by install.sh)
 """
+import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import psycopg2
 
