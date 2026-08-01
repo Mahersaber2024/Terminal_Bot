@@ -14,10 +14,12 @@ STATE_FILE="/etc/${SERVICE_NAME}.install_dir"
 
 REQUIRED_FILES=(
   "main.py"
+  "config.py"
   "crypto_utils.py"
   "sponsor_gate.py"
   "bot_settings.py"
   "subscription.py"
+  "setup_db.py"
   "requirements.txt"
 )
 
@@ -27,14 +29,16 @@ ADMIN_REQUIRED_FILES=(
   "admin.py"
 )
 
-# db/ package (main.py does "from db import get_db"; setup_db.py does
-# "from db.config import config" / "from db.database import Database").
+# db/ package (main.py does "from db import get_db"; setup_db.py, which now
+# lives at the repo root next to config.py, does "import config" for
+# DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD and "from db.database import
+# Database"). config.py used to be duplicated as its own db/config.py - that
+# file is gone now; all settings (bot + database) live in the single
+# top-level config.py, checked via REQUIRED_FILES above.
 # __init__.py is NOT listed here - it's auto-created if missing, same as
 # ServerManager/__init__.py below.
 DB_REQUIRED_FILES=(
-  "config.py"
   "database.py"
-  "setup_db.py"
 )
 
 # ServerManager/ package - names match main.py's actual imports
@@ -109,7 +113,7 @@ install_postgresql(){
   ok "PostgreSQL installed and started."
 }
 
-# Collects/creates the PostgreSQL role + database used by db/config.py
+# Collects/creates the PostgreSQL role + database used by config.py
 # (DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD in .env), mirroring the
 # nomone.py sample installer's setup_database() step.
 setup_database(){
@@ -276,17 +280,18 @@ setup_venv(){
 
 run_db_setup_script(){
   # setup_db.py reads DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD from .env
-  # via db/config.py, so this must run after write_env_file() and after the
-  # venv (with psycopg2) is ready. It lives at db/setup_db.py, not the repo
-  # root.
-  if [[ -f "${INSTALL_DIR}/db/setup_db.py" ]]; then
+  # via config.py, so this must run after write_env_file() and after the
+  # venv (with psycopg2) is ready. It lives at the repo root (setup_db.py),
+  # next to config.py - not inside db/ - since it does a plain "import
+  # config" that needs config.py to be on the script's own directory path.
+  if [[ -f "${INSTALL_DIR}/setup_db.py" ]]; then
     info "Creating database tables..."
     cd "${INSTALL_DIR}"
     source venv/bin/activate
-    python3 db/setup_db.py --auto || warn "Automatic table creation failed; you can run 'python3 db/setup_db.py' manually later"
+    python3 setup_db.py --auto || warn "Automatic table creation failed; you can run 'python3 setup_db.py' manually later"
     deactivate
   else
-    warn "db/setup_db.py not found; you need to create tables manually."
+    warn "setup_db.py not found; you need to create tables manually."
   fi
 }
 
