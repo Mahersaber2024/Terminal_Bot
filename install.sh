@@ -14,13 +14,10 @@ STATE_FILE="/etc/${SERVICE_NAME}.install_dir"
 
 REQUIRED_FILES=(
   "main.py"
-  "handlers.py"
-  "config.py"
   "crypto_utils.py"
   "sponsor_gate.py"
   "bot_settings.py"
   "subscription.py"
-  "setup_db.py"
   "requirements.txt"
 )
 
@@ -31,11 +28,13 @@ ADMIN_REQUIRED_FILES=(
 )
 
 # db/ package (main.py does "from db import get_db"; setup_db.py does
-# "from db.config import config" / "from db.database import Database")
+# "from db.config import config" / "from db.database import Database").
+# __init__.py is NOT listed here - it's auto-created if missing, same as
+# ServerManager/__init__.py below.
 DB_REQUIRED_FILES=(
-  "__init__.py"
   "config.py"
   "database.py"
+  "setup_db.py"
 )
 
 # ServerManager/ package - names match main.py's actual imports
@@ -256,6 +255,11 @@ verify_required_files(){
     exit 1
   fi
 
+  if [[ ! -f "${INSTALL_DIR}/db/__init__.py" ]]; then
+    warn "db/__init__.py not found — creating an empty one so 'db' is importable as a package."
+    touch "${INSTALL_DIR}/db/__init__.py"
+  fi
+
   ok "All required source files are present."
 }
 
@@ -273,15 +277,16 @@ setup_venv(){
 run_db_setup_script(){
   # setup_db.py reads DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD from .env
   # via db/config.py, so this must run after write_env_file() and after the
-  # venv (with psycopg2) is ready.
-  if [[ -f "${INSTALL_DIR}/setup_db.py" ]]; then
+  # venv (with psycopg2) is ready. It lives at db/setup_db.py, not the repo
+  # root.
+  if [[ -f "${INSTALL_DIR}/db/setup_db.py" ]]; then
     info "Creating database tables..."
     cd "${INSTALL_DIR}"
     source venv/bin/activate
-    python3 setup_db.py --auto || warn "Automatic table creation failed; you can run 'python3 setup_db.py' manually later"
+    python3 db/setup_db.py --auto || warn "Automatic table creation failed; you can run 'python3 db/setup_db.py' manually later"
     deactivate
   else
-    warn "setup_db.py not found; you need to create tables manually."
+    warn "db/setup_db.py not found; you need to create tables manually."
   fi
 }
 
