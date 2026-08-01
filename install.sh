@@ -29,14 +29,15 @@ ADMIN_REQUIRED_FILES=(
   "admin.py"
 )
 
-# db/ package (main.py does "from db import get_db"; setup_db.py, which now
-# lives at the repo root next to config.py, does "import config" for
-# DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD and "from db.database import
-# Database"). config.py used to be duplicated as its own db/config.py - that
-# file is gone now; all settings (bot + database) live in the single
-# top-level config.py, checked via REQUIRED_FILES above.
-# __init__.py is NOT listed here - it's auto-created if missing, same as
-# ServerManager/__init__.py below.
+# db/ package - main.py/admin.py/subscription.py do "from db.database
+# import get_db" (get_db() lives directly in database.py, next to the
+# Database class); setup_db.py, which lives at the repo root next to
+# config.py, does "import config" for DB_HOST/DB_PORT/DB_NAME/DB_USER/
+# DB_PASSWORD and "from db.database import Database". config.py used to be
+# duplicated as its own db/config.py - that file is gone now, merged into
+# the single top-level config.py (checked via REQUIRED_FILES above).
+# db/ has no __init__.py by design - Python treats it as an implicit
+# namespace package (3.3+), so no package-init file is needed at all.
 DB_REQUIRED_FILES=(
   "database.py"
 )
@@ -257,11 +258,6 @@ verify_required_files(){
     err "Please make sure these files are committed and pushed to: ${REPO_URL}"
     err "Then run this installer again (option 2: Update bot)."
     exit 1
-  fi
-
-  if [[ ! -f "${INSTALL_DIR}/db/__init__.py" ]]; then
-    warn "db/__init__.py not found — creating an empty one so 'db' is importable as a package."
-    touch "${INSTALL_DIR}/db/__init__.py"
   fi
 
   ok "All required source files are present."
