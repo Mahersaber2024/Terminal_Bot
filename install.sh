@@ -19,7 +19,6 @@ REQUIRED_FILES=(
   "sponsor_gate.py"
   "bot_settings.py"
   "subscription.py"
-  "setup_db.py"
   "requirements.txt"
 )
 
@@ -32,15 +31,17 @@ ADMIN_REQUIRED_FILES=(
 
 # db/ package - main.py/admin.py/subscription.py do "from db.database
 # import get_db" (get_db() lives directly in database.py, next to the
-# Database class); setup_db.py, which lives at the repo root next to
-# config.py, does "import config" for DB_HOST/DB_PORT/DB_NAME/DB_USER/
-# DB_PASSWORD and "from db.database import Database". config.py used to be
-# duplicated as its own db/config.py - that file is gone now, merged into
-# the single top-level config.py (checked via REQUIRED_FILES above).
+# Database class). db/setup_db.py inserts the repo root onto sys.path
+# itself before "import config" (see its own docstring), so it works
+# whether run as "python3 db/setup_db.py" or "python3 -m db.setup_db".
+# config.py used to be duplicated as its own db/config.py - that file is
+# gone now, merged into the single top-level config.py (checked via
+# REQUIRED_FILES above).
 # db/ has no __init__.py by design - Python treats it as an implicit
 # namespace package (3.3+), so no package-init file is needed at all.
 DB_REQUIRED_FILES=(
   "database.py"
+  "setup_db.py"
 )
 
 # ServerManager/ package - names match main.py's actual imports
@@ -276,19 +277,19 @@ setup_venv(){
 }
 
 run_db_setup_script(){
-  # setup_db.py reads DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD from .env
-  # via config.py, so this must run after write_env_file() and after the
-  # venv (with psycopg2) is ready. It lives at the repo root (setup_db.py),
-  # next to config.py - not inside db/ - since it does a plain "import
-  # config" that needs config.py to be on the script's own directory path.
-  if [[ -f "${INSTALL_DIR}/setup_db.py" ]]; then
+  # db/setup_db.py reads DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD from
+  # .env via the repo-root config.py, so this must run after
+  # write_env_file() and after the venv (with psycopg2) is ready. It
+  # inserts the repo root onto sys.path itself (see its own docstring), so
+  # running it as "python3 db/setup_db.py" from the repo root works fine.
+  if [[ -f "${INSTALL_DIR}/db/setup_db.py" ]]; then
     info "Creating database tables..."
     cd "${INSTALL_DIR}"
     source venv/bin/activate
-    python3 setup_db.py --auto || warn "Automatic table creation failed; you can run 'python3 setup_db.py' manually later"
+    python3 db/setup_db.py --auto || warn "Automatic table creation failed; you can run 'python3 db/setup_db.py' manually later"
     deactivate
   else
-    warn "setup_db.py not found; you need to create tables manually."
+    warn "db/setup_db.py not found; you need to create tables manually."
   fi
 }
 
