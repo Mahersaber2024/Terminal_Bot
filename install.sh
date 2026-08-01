@@ -23,9 +23,10 @@ REQUIRED_FILES=(
   "requirements.txt"
 )
 
-# admin/ package (main.py does "from admin import admin")
+# admin/ package (main.py does "from admin import admin") - no __init__.py
+# required either, same as db/ and ServerManager/ below: Python treats it
+# as an implicit namespace package (3.3+).
 ADMIN_REQUIRED_FILES=(
-  "__init__.py"
   "admin.py"
 )
 
@@ -45,9 +46,9 @@ DB_REQUIRED_FILES=(
 # ServerManager/ package - names match main.py's actual imports
 # ("from ServerManager import handlers as svm / health as svm_health /
 # automation as svm_auto"), plus the internal-only modules (engine,
-# settings, maintenance) those depend on.
+# settings, maintenance) those depend on. No __init__.py required - same
+# implicit namespace package as admin/ and db/ above.
 SERVERMANAGER_REQUIRED_FILES=(
-  "__init__.py"
   "handlers.py"
   "engine.py"
   "settings.py"
