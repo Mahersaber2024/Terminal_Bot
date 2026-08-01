@@ -18,14 +18,38 @@ REQUIRED_FILES=(
   "config.py"
   "crypto_utils.py"
   "sponsor_gate.py"
+  "bot_settings.py"
+  "subscription.py"
+  "setup_db.py"
   "requirements.txt"
 )
 
+# admin/ package (main.py does "from admin import admin")
+ADMIN_REQUIRED_FILES=(
+  "__init__.py"
+  "admin.py"
+)
+
+# db/ package (main.py does "from db import get_db"; setup_db.py does
+# "from db.config import config" / "from db.database import Database")
+DB_REQUIRED_FILES=(
+  "__init__.py"
+  "config.py"
+  "database.py"
+)
+
+# ServerManager/ package - names match main.py's actual imports
+# ("from ServerManager import handlers as svm / health as svm_health /
+# automation as svm_auto"), plus the internal-only modules (engine,
+# settings, maintenance) those depend on.
 SERVERMANAGER_REQUIRED_FILES=(
   "__init__.py"
-  "server_manager_handlers.py"
-  "server_manager_engine.py"
-  "server_manager_settings.py"
+  "handlers.py"
+  "engine.py"
+  "settings.py"
+  "health.py"
+  "automation.py"
+  "maintenance.py"
 )
 
 # ------------------ Colors ------------------
@@ -69,11 +93,111 @@ detect_python(){
 
 install_system_packages(){
   info "Installing system dependencies..."
-  # iputils-ping: server_manager_engine.py's quick-ping feature shells out
+  # iputils-ping: ServerManager/engine.py's quick-ping feature shells out
   # to "ping" directly, without SSH credentials.
+  # libpq-dev: needed to build psycopg2 from source if no prebuilt wheel
+  # is available for this server's architecture/Python version.
   apt-get update -y
-  apt-get install -y python3 python3-venv python3-pip git iputils-ping
+  apt-get install -y python3 python3-venv python3-pip python3-dev git curl libpq-dev iputils-ping
   ok "System dependencies installed."
+}
+
+install_postgresql(){
+  info "Installing PostgreSQL..."
+  apt-get install -y postgresql postgresql-contrib
+  systemctl enable postgresql
+  systemctl start postgresql
+  ok "PostgreSQL installed and started."
+}
+
+# Collects/creates the PostgreSQL role + database used by db/config.py
+# (DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD in .env), mirroring the
+# nomone.py sample installer's setup_database() step.
+setup_database(){
+  echo
+  echo "======================================"
+  echo " Database Setup"
+  echo "======================================"
+  read -rp "Do you want to install and configure PostgreSQL on this server? (y/n) [y]: " INSTALL_DB
+  INSTALL_DB=${INSTALL_DB:-y}
+
+  if [[ "$INSTALL_DB" =~ ^[Yy]$ ]]; then
+    if ! command -v psql &>/dev/null; then
+      install_postgresql
+    else
+      info "PostgreSQL is already installed on the server."
+      systemctl enable postgresql &>/dev/null || true
+      systemctl start postgresql &>/dev/null || true
+    fi
+
+    read -rp "Database name [terminal_bot]: " DB_NAME
+    DB_NAME=${DB_NAME:-terminal_bot}
+    read -rp "Database username [terminal_bot]: " DB_USER
+    DB_USER=${DB_USER:-terminal_bot}
+    DB_HOST="localhost"
+    DB_PORT="5432"
+
+    # ---- Check for existing role/database ----
+    ROLE_EXISTS=$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}'")
+    DB_EXISTS=$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'")
+
+    if [[ "$ROLE_EXISTS" == "1" || "$DB_EXISTS" == "1" ]]; then
+      warn "User «${DB_USER}» or database «${DB_NAME}» already exists on this server."
+      echo " 1) Use the existing database/user (no password change)"
+      echo " 2) Reset password for the existing user"
+      echo " 3) Enter a new username/database (create a new set)"
+      read -rp "Your choice [1]: " DB_EXIST_CHOICE
+      DB_EXIST_CHOICE=${DB_EXIST_CHOICE:-1}
+      case "$DB_EXIST_CHOICE" in
+        1)
+          DB_PASS=""
+          while [[ -z "$DB_PASS" ]]; do
+            read -rsp "Enter the current password for «${DB_USER}» (only for saving in .env, nothing will change in the database): " DB_PASS
+            echo
+          done
+          ok "Using existing database/user; no password was changed."
+          return
+          ;;
+        2)
+          DB_PASS=""
+          while [[ -z "$DB_PASS" ]]; do
+            read -rsp "New password for user «${DB_USER}»: " DB_PASS
+            echo
+          done
+          sudo -u postgres psql -c "ALTER ROLE ${DB_USER} WITH PASSWORD '${DB_PASS}';" >/dev/null
+          [[ "$DB_EXISTS" != "1" ]] && sudo -u postgres psql -c "CREATE DATABASE ${DB_NAME} OWNER ${DB_USER};"
+          sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${DB_USER};" >/dev/null
+          ok "Password has been updated."
+          return
+          ;;
+        3)
+          setup_database # Start over with new names
+          return
+          ;;
+      esac
+    fi
+
+    # ---- Normal path: nothing exists yet ----
+    DB_PASS=""
+    while [[ -z "$DB_PASS" ]]; do
+      read -rsp "Password for database user (required): " DB_PASS
+      echo
+    done
+    info "Creating user and database in PostgreSQL..."
+    sudo -u postgres psql -c "CREATE ROLE ${DB_USER} LOGIN PASSWORD '${DB_PASS}';"
+    sudo -u postgres psql -c "CREATE DATABASE ${DB_NAME} OWNER ${DB_USER};"
+    sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${DB_USER};" >/dev/null
+    ok "Database «${DB_NAME}» and user «${DB_USER}» have been created."
+  else
+    info "Please enter existing database connection details:"
+    read -rp "Database host: " DB_HOST
+    read -rp "Database port [5432]: " DB_PORT
+    DB_PORT=${DB_PORT:-5432}
+    read -rp "Database name: " DB_NAME
+    read -rp "Database username: " DB_USER
+    read -rsp "Database password: " DB_PASS
+    echo
+  fi
 }
 
 clone_or_update_repo(){
@@ -114,6 +238,12 @@ verify_required_files(){
   for f in "${REQUIRED_FILES[@]}"; do
     [[ -f "${INSTALL_DIR}/${f}" ]] || missing+=("$f")
   done
+  for f in "${ADMIN_REQUIRED_FILES[@]}"; do
+    [[ -f "${INSTALL_DIR}/admin/${f}" ]] || missing+=("admin/$f")
+  done
+  for f in "${DB_REQUIRED_FILES[@]}"; do
+    [[ -f "${INSTALL_DIR}/db/${f}" ]] || missing+=("db/$f")
+  done
   for f in "${SERVERMANAGER_REQUIRED_FILES[@]}"; do
     [[ -f "${INSTALL_DIR}/ServerManager/${f}" ]] || missing+=("ServerManager/$f")
   done
@@ -124,11 +254,6 @@ verify_required_files(){
     err "Please make sure these files are committed and pushed to: ${REPO_URL}"
     err "Then run this installer again (option 2: Update bot)."
     exit 1
-  fi
-
-  if [[ ! -f "${INSTALL_DIR}/ServerManager/__init__.py" ]]; then
-    warn "ServerManager/__init__.py not found — creating an empty one so 'ServerManager' is importable as a package."
-    touch "${INSTALL_DIR}/ServerManager/__init__.py"
   fi
 
   ok "All required source files are present."
@@ -143,6 +268,21 @@ setup_venv(){
   pip install -r requirements.txt -q
   deactivate
   ok "Python packages installed."
+}
+
+run_db_setup_script(){
+  # setup_db.py reads DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD from .env
+  # via db/config.py, so this must run after write_env_file() and after the
+  # venv (with psycopg2) is ready.
+  if [[ -f "${INSTALL_DIR}/setup_db.py" ]]; then
+    info "Creating database tables..."
+    cd "${INSTALL_DIR}"
+    source venv/bin/activate
+    python3 setup_db.py --auto || warn "Automatic table creation failed; you can run 'python3 setup_db.py' manually later"
+    deactivate
+  else
+    warn "setup_db.py not found; you need to create tables manually."
+  fi
 }
 
 collect_bot_config(){
@@ -184,6 +324,11 @@ ADMIN_IDS=${ADMIN_IDS}
 SPONSOR_CHANNELS=${SPONSOR_CHANNELS}
 SPONSOR_CHANNEL_LINKS=${SPONSOR_CHANNEL_LINKS}
 CRYPTO_SECRET=${CRYPTO_SECRET}
+DB_HOST=${DB_HOST}
+DB_PORT=${DB_PORT}
+DB_NAME=${DB_NAME}
+DB_USER=${DB_USER}
+DB_PASSWORD=${DB_PASS}
 EOF
   chmod 600 "${env_file}"
   ok ".env file created (restricted access)."
@@ -230,6 +375,8 @@ show_summary(){
   echo " Restart      : systemctl restart ${SERVICE_NAME}"
   echo
   echo " Config file (.env) : ${INSTALL_DIR}/.env"
+  echo
+  echo " Database : ${DB_NAME:-N/A} @ ${DB_HOST:-N/A}:${DB_PORT:-N/A} (user: ${DB_USER:-N/A})"
   echo "============================================================"
 }
 
@@ -241,11 +388,13 @@ full_install(){
   detect_python
   install_dir_prompt
   install_system_packages
+  setup_database
   clone_or_update_repo
   verify_required_files
   setup_venv
   collect_bot_config
   write_env_file
+  run_db_setup_script
   create_systemd_service
   save_install_dir
   ok "✅ Installation completed successfully! 🎉"
@@ -263,6 +412,7 @@ update_bot(){
   clone_or_update_repo
   verify_required_files
   setup_venv
+  run_db_setup_script
   systemctl restart "${SERVICE_NAME}"
   save_install_dir
   ok "Update completed and service restarted."
@@ -300,6 +450,16 @@ uninstall_bot(){
   load_install_dir
   read -rp "Installation path to remove [${INSTALL_DIR}]: " DEL_DIR
   DEL_DIR=${DEL_DIR:-$INSTALL_DIR}
+
+  read -rp "Also drop the PostgreSQL database? (y/n) [n]: " DROP_DB
+  DROP_DB=${DROP_DB:-n}
+  if [[ "$DROP_DB" =~ ^[Yy]$ ]] && command -v psql &>/dev/null; then
+    read -rp "Database name to delete: " DB_NAME_DEL
+    read -rp "Database username to delete: " DB_USER_DEL
+    sudo -u postgres psql -c "DROP DATABASE IF EXISTS ${DB_NAME_DEL};" || true
+    sudo -u postgres psql -c "DROP ROLE IF EXISTS ${DB_USER_DEL};" || true
+    ok "Database deleted."
+  fi
 
   if [[ -d "$DEL_DIR" ]]; then
     rm -rf "$DEL_DIR"
