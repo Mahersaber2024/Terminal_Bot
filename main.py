@@ -20,7 +20,7 @@ import config
 import crypto_utils
 import subscription
 import sponsor_gate
-from db import get_db
+from db.database import get_db
 from ServerManager import handlers as svm
 from ServerManager import health as svm_health
 from ServerManager import automation as svm_auto

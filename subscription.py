@@ -25,7 +25,7 @@ from telegram.ext import ContextTypes, ConversationHandler
 
 import bot_settings
 import config
-from db import get_db
+from db.database import get_db
 
 logger = logging.getLogger(__name__)
 

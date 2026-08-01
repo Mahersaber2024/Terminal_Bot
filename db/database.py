@@ -25,6 +25,8 @@ from datetime import datetime, timedelta
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
+import config
+
 logger = logging.getLogger(__name__)
 
 
@@ -456,3 +458,27 @@ class Database:
             "DELETE FROM payment_requests WHERE request_id = %s RETURNING *", (request_id,), fetch="one"
         )
         return dict(row) if row else None
+
+
+# ==================================================================
+# Module-level singleton accessor
+# ==================================================================
+# Lives here (rather than in a db/__init__.py) so the db/ folder doesn't
+# need its own package-init file - `import db.database` / `from db.database
+# import get_db` works via Python's implicit namespace packages (3.3+),
+# with no __init__.py required.
+#
+#   from db.database import get_db
+#   db = get_db()
+#
+# Database.__init__() connects to PostgreSQL and creates tables, which
+# should only happen once per process - hence the lazy singleton instead of
+# every call site constructing its own Database(...).
+_db = None
+
+
+def get_db() -> Database:
+    global _db
+    if _db is None:
+        _db = Database(config.get_db_config())
+    return _db

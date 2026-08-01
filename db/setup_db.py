@@ -3,8 +3,11 @@ setup_db.py
 ===========
 Run this once (and again after pulling updates that add new tables) to
 create/verify the PostgreSQL schema used by Terminal Bot. Reads connection
-settings from .env via db/config.py (DB_HOST, DB_PORT, DB_NAME, DB_USER,
-DB_PASSWORD) - see db/config.py for the full list.
+settings from .env via config.py (DB_HOST, DB_PORT, DB_NAME, DB_USER,
+DB_PASSWORD) - see config.py for the full list. (Database settings used to
+live in a separate db/config.py - that file has been merged into the
+top-level config.py, so there's now a single config file for the whole
+project.)
 
 Usage:
     python3 setup_db.py            # interactive
@@ -14,7 +17,7 @@ import sys
 
 import psycopg2
 
-from db.config import config
+import config
 
 DB_CONFIG = config.get_db_config()
 

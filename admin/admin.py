@@ -16,7 +16,7 @@ from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, Con
 import bot_settings
 import config
 import subscription
-from db import get_db
+from db.database import get_db
 from ServerManager import health as svm_health
 
 logger = logging.getLogger(__name__)
