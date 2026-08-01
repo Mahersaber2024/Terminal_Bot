@@ -3,7 +3,9 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError
 from telegram.ext import ApplicationHandlerStop, ContextTypes
 
+import bot_settings
 import config
+from db import get_db
 
 logger = logging.getLogger(__name__)
 
@@ -14,7 +16,7 @@ _JOINED_STATUSES = {"member", "administrator", "creator"}
 
 
 def _channel_link(channel: dict) -> str:
-    link = config.SPONSOR_CHANNEL_LINKS.get(str(channel["id"]))
+    link = channel.get("link")
     if link:
         return link
     cid = channel["id"]
@@ -28,13 +30,16 @@ async def _is_member(bot, channel_id, user_id) -> bool:
         member = await bot.get_chat_member(chat_id=channel_id, user_id=user_id)
         return member.status in _JOINED_STATUSES
     except TelegramError as e:
+        # Most common cause: the bot isn't an admin in the channel, or the
+        # user has never interacted with it. Fail closed (treat as "not
+        # joined") but log it so the misconfiguration is easy to spot.
         logger.warning(f"Sponsor check failed for channel {channel_id}: {e}")
         return False
 
 
 async def _missing_channels(bot, user_id):
     missing = []
-    for channel in config.SPONSOR_CHANNELS:
+    for channel in bot_settings.get_sponsor_channels():
         if not await _is_member(bot, channel["id"], user_id):
             missing.append(channel)
     return missing
@@ -54,12 +59,30 @@ def _prompt_text(missing):
 
 
 async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not config.SPONSOR_CHANNELS:
-        return  # gate disabled
-
     user = update.effective_user
     if user is None:
         return
+
+    if user.id in config.ADMIN_IDS:
+        return  # admins always bypass their own gate
+
+    try:
+        if get_db().is_banned(user.id):
+            if update.message:
+                await update.message.reply_text("⛔️ You have been banned from using this bot.")
+            elif update.callback_query:
+                try:
+                    await update.callback_query.answer("⛔️ You have been banned from using this bot.", show_alert=True)
+                except TelegramError:
+                    pass
+            raise ApplicationHandlerStop
+    except ApplicationHandlerStop:
+        raise
+    except Exception as e:
+        logger.error(f"Ban check failed for user {user.id}: {e}")
+
+    if not bot_settings.is_membership_required() or not bot_settings.get_sponsor_channels():
+        return  # gate disabled, or no channels configured
 
     missing = await _missing_channels(context.bot, user.id)
     if not missing:
@@ -101,5 +124,10 @@ async def sponsor_check_callback(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text("✅ Membership confirmed - you're all set!")
     except TelegramError:
         pass
-    import handlers
-    await handlers.start(update, context)
+
+    # Send a fresh /start so the user immediately sees the main menu instead
+    # of having to type /start themselves. Deferred import (rather than at
+    # module load time) to avoid a circular import with main.py, which
+    # imports sponsor_gate itself.
+    import main
+    await main.start(update, context)
