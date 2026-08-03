@@ -19,8 +19,32 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-if [[ -z "$ARCHIVE" || ! -f "$ARCHIVE" ]]; then
-  err "Backup file not found. Usage: sudo bash restore_backup.sh backup.tar.gz /opt/terminal-bot"
+if [[ -z "$ARCHIVE" ]]; then
+  err "No backup file given. Usage: sudo bash restore_backup.sh backup.tar.gz /opt/terminal-bot"
+  exit 1
+fi
+
+if [[ ! -f "$ARCHIVE" ]]; then
+  # Show exactly where we looked, and try to help find the real file.
+  RESOLVED_PATH="${ARCHIVE}"
+  if [[ "${ARCHIVE}" != /* ]]; then
+    RESOLVED_PATH="$(pwd)/${ARCHIVE}"
+  fi
+  err "Backup file not found at: ${RESOLVED_PATH}"
+  echo ""
+  info "You gave a relative path, which is resolved against your CURRENT directory ($(pwd))."
+  info "If you scp'd the file to a different folder (e.g. /root/), either:"
+  echo "   1) pass the full path:"
+  echo "        sudo bash restore_backup.sh /root/$(basename "$ARCHIVE") ${INSTALL_DIR}"
+  echo "   2) or move/copy it here first:"
+  echo "        cp /root/$(basename "$ARCHIVE") ."
+  echo "        sudo bash restore_backup.sh $(basename "$ARCHIVE") ${INSTALL_DIR}"
+  echo ""
+  FOUND=$(find / -xdev -maxdepth 4 -name "$(basename "$ARCHIVE")" 2>/dev/null | grep -v "^${RESOLVED_PATH}$" | head -n3 || true)
+  if [[ -n "$FOUND" ]]; then
+    warn "Found a file with this name elsewhere on the system:"
+    echo "$FOUND" | sed 's/^/   /'
+  fi
   exit 1
 fi
 
