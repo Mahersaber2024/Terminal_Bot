@@ -72,9 +72,29 @@ systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
 # ---------- 2) Restore .env / bot_settings.json / requirements.txt ----------
 if [[ -d "${STAGE_DIR}/root_files" ]]; then
   info "Restoring root-level configuration files ..."
-  cp -p "${STAGE_DIR}/root_files/"* "${INSTALL_DIR}/" 2>/dev/null || true
+  # NOTE: "dir/"* does NOT match dotfiles like .env in bash by default
+  # (no dotglob), so we copy known filenames explicitly instead of
+  # relying on a glob - that silent gap previously left .env un-restored
+  # even though this step reported success.
+  RESTORED_ANY=0
+  for f in .env bot_settings.json requirements.txt; do
+    SRC="${STAGE_DIR}/root_files/${f}"
+    if [[ -f "$SRC" ]]; then
+      if cp -p "$SRC" "${INSTALL_DIR}/${f}"; then
+        ok "Restored: ${f}"
+        RESTORED_ANY=1
+      else
+        err "Failed to copy ${f} into ${INSTALL_DIR}/ - check permissions."
+      fi
+    fi
+  done
+  if [[ ! -f "${INSTALL_DIR}/.env" ]]; then
+    err ".env was not restored - aborting before touching the database."
+    rm -rf "$WORK_DIR"
+    exit 1
+  fi
   chmod 600 "${INSTALL_DIR}/.env" 2>/dev/null || true
-  ok "Configuration files restored (.env, bot_settings.json)."
+  [[ "$RESTORED_ANY" -eq 1 ]] || warn "No known config files found inside root_files/ in the archive."
 else
   err "root_files/ not found in the backup archive - nothing to restore."
   rm -rf "$WORK_DIR"
@@ -85,9 +105,19 @@ fi
 if [[ -d "${STAGE_DIR}/ServerManager" ]]; then
   info "Restoring ServerManager/ local data ..."
   mkdir -p "${INSTALL_DIR}/ServerManager"
-  cp -p "${STAGE_DIR}/ServerManager/"* "${INSTALL_DIR}/ServerManager/" 2>/dev/null || true
-  ok "ServerManager/ data restored."
-  warn "Saved SSH server passwords/private keys only decrypt correctly if CRYPTO_SECRET in the restored .env is unchanged from the original server."
+  sm_found=0
+  for f in server_manager_settings.json server_manager_automation.json known_hosts.json; do
+    SRC="${STAGE_DIR}/ServerManager/${f}"
+    if [[ -f "$SRC" ]]; then
+      if cp -p "$SRC" "${INSTALL_DIR}/ServerManager/${f}"; then
+        ok "Restored: ServerManager/${f}"
+        sm_found=1
+      else
+        err "Failed to copy ServerManager/${f} - check permissions."
+      fi
+    fi
+  done
+  [[ "$sm_found" -eq 1 ]] && warn "Saved SSH server passwords/private keys only decrypt correctly if CRYPTO_SECRET in the restored .env is unchanged from the original server."
 fi
 
 # ---------- 4) Read target DB credentials from the freshly restored .env ----------
