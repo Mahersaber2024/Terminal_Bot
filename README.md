@@ -68,6 +68,42 @@ journalctl -u terminal-bot -f
 
 Set in `.env`: `BOT_TOKEN`, `ADMIN_IDS`, `SPONSOR_CHANNELS`, `SPONSOR_CHANNEL_LINKS`, `CRYPTO_SECRET`.
 
+## Backup & Restore
+
+One-click scripts to move the whole bot (database, config, and encrypted
+server credentials) to a new server.
+
+**On the current server**, back everything up into a single archive:
+
+```bash
+sudo bash full_backup.sh /opt/terminal-bot /opt/backups
+```
+
+This dumps the PostgreSQL database and copies `.env`, `bot_settings.json`,
+and the `ServerManager/` local data (`server_manager_settings.json`,
+`server_manager_automation.json`, `known_hosts.json`) into one
+`terminalbot_backup_TIMESTAMP.tar.gz`.
+
+> ⚠️ The archive contains the bot token, DB password, and `CRYPTO_SECRET` —
+> transfer it only over a secure channel (e.g. `scp`), and keep it somewhere safe.
+
+**On the new server**, install the bot first (see [Install](#install)),
+then restore:
+
+```bash
+scp terminalbot_backup_*.tar.gz root@NEW_SERVER_IP:/root/
+sudo bash restore_backup.sh terminalbot_backup_*.tar.gz /opt/terminal-bot
+```
+
+This restores `.env`, `bot_settings.json`, and `ServerManager/` data,
+recreates the database/role if needed, restores the dump, and restarts the
+`terminal-bot` service.
+
+Because `CRYPTO_SECRET` travels with the backup inside `.env`, previously
+saved SSH server passwords/keys decrypt correctly on the new server too —
+just don't restore an old backup's data files against a *different*,
+already-configured `.env`, or decryption will fail.
+
 ## Security notes
 
 - Server passwords are stored encrypted in `ServerManager/server_manager_settings.json` — losing `CRYPTO_SECRET` makes them unrecoverable.
