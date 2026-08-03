@@ -148,11 +148,14 @@ WITHOUT this exact .env makes any previously saved SSH credentials
 permanently unreadable (they will NOT be re-encrypted automatically).
 
 To restore on a new server:
-  1) Copy this single file (terminalbot_backup_*.tar.gz) to the new server.
-  2) Install the project per install.sh (or at least PostgreSQL + venv +
-     the terminal-bot systemd service pointing at the install path below).
-  3) Run restore_backup.sh:
-       sudo bash restore_backup.sh terminalbot_backup_*.tar.gz ${INSTALL_DIR}
+  1) Install the project there first (this creates backups/restore_backup.sh):
+       bash <(curl -fsSL https://raw.githubusercontent.com/Mahersaber2024/Terminal_Bot/main/install.sh)
+  2) Copy this single file (terminalbot_backup_*.tar.gz) to the new server,
+     e.g. into /root/.
+  3) cd into the backups folder and run restore_backup.sh with the FULL
+     path to wherever you copied the archive:
+       cd ${INSTALL_DIR}/backups
+       sudo bash restore_backup.sh /root/terminalbot_backup_*.tar.gz ${INSTALL_DIR}
 EOF
 
 # ---------- 6) Compress everything into one final archive ----------
@@ -171,8 +174,12 @@ echo "   📦 ${FINAL_ARCHIVE} ($(du -h "$FINAL_ARCHIVE" | cut -f1))"
 echo ""
 warn "This file contains the bot token, DB password, and CRYPTO_SECRET — transfer it only over a secure channel (scp/sftp)."
 echo ""
-info "To transfer to the new server, e.g.:"
-echo "   scp ${FINAL_ARCHIVE} root@NEW_SERVER_IP:/root/"
-echo ""
-info "Then on the new server:"
-echo "   sudo bash restore_backup.sh $(basename "$FINAL_ARCHIVE") ${INSTALL_DIR}"
+info "To restore on a new server:"
+echo "   1) Install the project there first (this creates backups/restore_backup.sh):"
+echo "        bash <(curl -fsSL https://raw.githubusercontent.com/Mahersaber2024/Terminal_Bot/main/install.sh)"
+echo "   2) Copy this archive over:"
+echo "        scp ${FINAL_ARCHIVE} root@NEW_SERVER_IP:/root/"
+echo "   3) On the new server, cd into the backups folder and run restore_backup.sh"
+echo "      with the FULL path to the archive you copied:"
+echo "        cd ${INSTALL_DIR}/backups"
+echo "        sudo bash restore_backup.sh /root/$(basename "$FINAL_ARCHIVE") ${INSTALL_DIR}"
