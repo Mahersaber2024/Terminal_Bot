@@ -31,6 +31,8 @@ ADMIN_CHANNEL_ADD_ID, ADMIN_CHANNEL_ADD_TITLE, ADMIN_CHANNEL_ADD_LINK = range(3)
     ADMIN_PLAN_ADD_MAXTABS,
     ADMIN_PLAN_ADD_DESC,
 ) = range(3, 9)
+ADMIN_PLAN_ADD_SFTP, ADMIN_PLAN_ADD_TIMEOUT, ADMIN_PLAN_ADD_MAXAUTO = 19, 20, 21
+ADMIN_PLAN_EDIT_VALUE = 22
 ADMIN_CARD_NUMBER, ADMIN_CARD_HOLDER, ADMIN_CARD_BANK = range(9, 12)
 (
     ADMIN_MON_INTERVAL,
@@ -537,24 +539,46 @@ async def admin_user_balance_input(update: Update, context: ContextTypes.DEFAULT
 def _plans_menu_text_and_keyboard():
     all_plans = subscription.get_all_plans(active_only=False)
     if all_plans:
-        lines = []
-        for p in all_plans.values():
-            status = "✅" if p.get("enabled", True) else "❌"
-            lines.append(
-                f"{status} {p['name']} - {p['price']:,} / {p['days']}d "
-                f"(🖥{p['max_servers']} 📑{p['max_tabs']})"
+        # Whichever enabled plan is cheapest (normally the free one, price 0)
+        # is what new users are auto-granted - purely informational here,
+        # nothing for the admin to configure. See Database.get_default_plan().
+        default_id = None
+        enabled = [(pid, p) for pid, p in all_plans.items() if p.get("enabled", True)]
+        if enabled:
+            default_id = min(enabled, key=lambda item: (item[1]["price"], item[1].get("plan_order", 0)))[0]
+
+        blocks = []
+        for pid, p in all_plans.items():
+            status = "🟢 Active" if p.get("enabled", True) else "🔴 Disabled"
+            free_flag = "  🆓 default for new users" if pid == default_id else ""
+            price_txt = "Free" if p["price"] == 0 else f"{p['price']:,} / {p['days']}d"
+            sftp_flag = "✅ SFTP" if p.get("sftp_enabled", True) else "🔒 No SFTP"
+            timeout = p.get("session_timeout_minutes")
+            timeout_txt = f"⏱ {timeout}m session" if timeout else "⏱ Unlimited session"
+            max_auto = p.get("max_automations")
+            max_auto_txt = f"⚙️ {max_auto} automations" if max_auto is not None else "⚙️ Unlimited automations"
+            blocks.append(
+                f"*{p['name']}*{free_flag}\n"
+                f"{status}  ·  💰 {price_txt}\n"
+                f"🖥 {p['max_servers']} servers  ·  📑 {p['max_tabs']} tabs  ·  {sftp_flag}\n"
+                f"{timeout_txt}  ·  {max_auto_txt}"
             )
-        plan_lines = "\n".join(lines)
+        plan_lines = "\n\n".join(blocks)
     else:
         plan_lines = "(no plans yet)"
 
-    text = f"📦 Plans\n\n{plan_lines}\n\nTap a plan below to toggle or delete it."
+    text = (
+        f"📦 *Plans*\n\n{plan_lines}\n\n"
+        f"🆓 New users are automatically granted the cheapest active plan - no need to pick one.\n"
+        f"Tap a plan below to toggle it on/off, edit it, or delete it."
+    )
 
     keyboard = [[InlineKeyboardButton("➕ Add Plan", callback_data="admin_plan_add")]]
     for pid, p in all_plans.items():
         status = "🟢" if p.get("enabled", True) else "🔴"
         keyboard.append([
             InlineKeyboardButton(f"{status} {p['name']}", callback_data=f"admin_plan_toggle_{pid}"),
+            InlineKeyboardButton("✏️", callback_data=f"admin_plan_edit_{pid}"),
             InlineKeyboardButton("🗑", callback_data=f"admin_plan_delete_{pid}"),
         ])
     keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="admin_back_to_main")])
@@ -568,7 +592,7 @@ async def admin_plans_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⛔️ You do not have admin access.")
         return
     text, reply_markup = _plans_menu_text_and_keyboard()
-    await query.edit_message_text(text, reply_markup=reply_markup)
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
 
 
 async def admin_plan_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -582,7 +606,7 @@ async def admin_plan_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await query.answer("❌ Plan not found.", show_alert=True)
     text, reply_markup = _plans_menu_text_and_keyboard()
-    await query.edit_message_text(text, reply_markup=reply_markup)
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
 
 
 async def admin_plan_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -597,7 +621,209 @@ async def admin_plan_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await query.answer("❌ Plan not found.", show_alert=True)
     text, reply_markup = _plans_menu_text_and_keyboard()
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+
+
+# ====================== Edit an existing plan (per-field) ======================
+# Reuses subscription.update_plan(plan_id, **kwargs) (db/database.py's
+# update_plan), so this can edit any single field of an already-created
+# plan without recreating it - unlike admin_plan_add_* below, which only
+# creates brand-new plans.
+
+_PLAN_EDIT_FIELD_PROMPTS = {
+    "name": "🏷 Send the new name:",
+    "description": "📝 Send the new description, or \"-\" for none:",
+    "price": "💰 Send the new price (a plain number):",
+    "days": "⏳ Send the new duration in days:",
+    "max_servers": "🖥 Send the new max number of servers:",
+    "max_tabs": "📑 Send the new max concurrent terminal tabs:",
+    "session_timeout_minutes": "⏱ Send the new max SSH session length in minutes (send 0 for unlimited):",
+    "max_automations": "⚙️ Send the new max number of automation jobs (send 0 for unlimited):",
+}
+
+
+def _plan_edit_text_and_keyboard(plan_id: str):
+    plan = subscription.get_plan(plan_id)
+    if not plan:
+        return None, None
+
+    sftp_flag = "✅ Included" if plan.get("sftp_enabled", True) else "🔒 Not included"
+    timeout = plan.get("session_timeout_minutes")
+    timeout_txt = f"{timeout}m" if timeout else "Unlimited"
+    max_auto = plan.get("max_automations")
+    max_auto_txt = str(max_auto) if max_auto is not None else "Unlimited"
+
+    text = (
+        f"✏️ Edit Plan: {plan['name']}\n\n"
+        f"🏷 Name: {plan['name']}\n"
+        f"📝 Description: {plan.get('description') or '(none)'}\n"
+        f"💰 Price: {plan['price']:,}\n"
+        f"⏳ Days: {plan['days']}\n"
+        f"🖥 Max servers: {plan['max_servers']}\n"
+        f"📑 Max tabs: {plan['max_tabs']}\n"
+        f"🗄 SFTP: {sftp_flag}\n"
+        f"⏱ Session timeout: {timeout_txt}\n"
+        f"⚙️ Max automations: {max_auto_txt}\n\n"
+        f"Tap a field below to change it."
+    )
+
+    keyboard = [
+        [
+            InlineKeyboardButton("🏷 Name", callback_data=f"admin_plan_ef_{plan_id}|name"),
+            InlineKeyboardButton("📝 Description", callback_data=f"admin_plan_ef_{plan_id}|description"),
+        ],
+        [
+            InlineKeyboardButton("💰 Price", callback_data=f"admin_plan_ef_{plan_id}|price"),
+            InlineKeyboardButton("⏳ Days", callback_data=f"admin_plan_ef_{plan_id}|days"),
+        ],
+        [
+            InlineKeyboardButton("🖥 Max servers", callback_data=f"admin_plan_ef_{plan_id}|max_servers"),
+            InlineKeyboardButton("📑 Max tabs", callback_data=f"admin_plan_ef_{plan_id}|max_tabs"),
+        ],
+        [InlineKeyboardButton(
+            f"🗄 SFTP: {'✅ on' if plan.get('sftp_enabled', True) else '🔒 off'} (tap to toggle)",
+            callback_data=f"admin_plan_ef_{plan_id}|sftp_toggle",
+        )],
+        [
+            InlineKeyboardButton("⏱ Session timeout", callback_data=f"admin_plan_ef_{plan_id}|session_timeout_minutes"),
+            InlineKeyboardButton("⚙️ Max automations", callback_data=f"admin_plan_ef_{plan_id}|max_automations"),
+        ],
+        [InlineKeyboardButton("🔙 Back to Plans", callback_data="admin_plans_menu")],
+    ]
+    return text, InlineKeyboardMarkup(keyboard)
+
+
+async def admin_plan_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        await query.edit_message_text("⛔️ You do not have admin access.")
+        return
+
+    plan_id = query.data.replace("admin_plan_edit_", "")
+    text, reply_markup = _plan_edit_text_and_keyboard(plan_id)
+    if text is None:
+        await query.answer("❌ Plan not found.", show_alert=True)
+        return
     await query.edit_message_text(text, reply_markup=reply_markup)
+
+
+async def admin_plan_edit_field_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        await query.edit_message_text("⛔️ You do not have admin access.")
+        return ConversationHandler.END
+
+    plan_id, _, field = query.data.replace("admin_plan_ef_", "").partition("|")
+    plan = subscription.get_plan(plan_id)
+    if not plan:
+        await query.answer("❌ Plan not found.", show_alert=True)
+        return ConversationHandler.END
+
+    if field == "sftp_toggle":
+        # Instant toggle, no text input needed - same pattern as
+        # admin_plan_toggle for enabled/disabled.
+        subscription.update_plan(plan_id, sftp_enabled=not plan.get("sftp_enabled", True))
+        logger.info(f"Admin {query.from_user.id} toggled sftp_enabled for plan {plan_id}")
+        text, reply_markup = _plan_edit_text_and_keyboard(plan_id)
+        await query.edit_message_text(text, reply_markup=reply_markup)
+        return ConversationHandler.END
+
+    prompt = _PLAN_EDIT_FIELD_PROMPTS.get(field)
+    if not prompt:
+        await query.answer("❌ Unknown field.", show_alert=True)
+        return ConversationHandler.END
+
+    context.user_data["admin_edit_plan"] = {"plan_id": plan_id, "field": field}
+    await _edit_then_prompt_cancel(query, prompt)
+    return ADMIN_PLAN_EDIT_VALUE
+
+
+async def admin_plan_edit_value_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    target = context.user_data.get("admin_edit_plan")
+    if not target:
+        await update.message.reply_text("❌ Something went wrong, please try again.", reply_markup=get_main_menu())
+        return ConversationHandler.END
+
+    plan_id, field = target["plan_id"], target["field"]
+    text = update.message.text.strip()
+    kwargs = {}
+
+    if field == "name":
+        if not text:
+            await update.message.reply_text("❌ Please send a name, or tap Cancel.", reply_markup=_cancel_kb())
+            return ADMIN_PLAN_EDIT_VALUE
+        kwargs["name"] = text
+    elif field == "description":
+        kwargs["description"] = "" if text == "-" else text
+    elif field == "price":
+        clean = text.replace(",", "")
+        if not clean.isdigit():
+            await update.message.reply_text(
+                "❌ Please send a valid non-negative number, or tap Cancel.", reply_markup=_cancel_kb()
+            )
+            return ADMIN_PLAN_EDIT_VALUE
+        kwargs["price"] = int(clean)
+    elif field == "days":
+        if not text.isdigit() or int(text) <= 0:
+            await update.message.reply_text(
+                "❌ Please send a valid positive number of days, or tap Cancel.", reply_markup=_cancel_kb()
+            )
+            return ADMIN_PLAN_EDIT_VALUE
+        kwargs["days"] = int(text)
+    elif field == "max_servers":
+        if not text.isdigit() or int(text) <= 0:
+            await update.message.reply_text(
+                "❌ Please send a valid positive number, or tap Cancel.", reply_markup=_cancel_kb()
+            )
+            return ADMIN_PLAN_EDIT_VALUE
+        kwargs["max_servers"] = int(text)
+    elif field == "max_tabs":
+        if not text.isdigit() or int(text) <= 0:
+            await update.message.reply_text(
+                "❌ Please send a valid positive number, or tap Cancel.", reply_markup=_cancel_kb()
+            )
+            return ADMIN_PLAN_EDIT_VALUE
+        kwargs["max_tabs"] = int(text)
+    elif field == "session_timeout_minutes":
+        if not text.isdigit():
+            await update.message.reply_text(
+                "❌ Please send a whole number (0 for unlimited), or tap Cancel.", reply_markup=_cancel_kb()
+            )
+            return ADMIN_PLAN_EDIT_VALUE
+        minutes = int(text)
+        kwargs["session_timeout_minutes"] = minutes if minutes > 0 else None
+    elif field == "max_automations":
+        if not text.isdigit():
+            await update.message.reply_text(
+                "❌ Please send a whole number (0 for unlimited), or tap Cancel.", reply_markup=_cancel_kb()
+            )
+            return ADMIN_PLAN_EDIT_VALUE
+        count = int(text)
+        kwargs["max_automations"] = count if count > 0 else None
+    else:
+        context.user_data.pop("admin_edit_plan", None)
+        await update.message.reply_text("❌ Unknown field.", reply_markup=get_main_menu())
+        return ConversationHandler.END
+
+    context.user_data.pop("admin_edit_plan", None)
+    ok = subscription.update_plan(plan_id, **kwargs)
+    logger.info(f"Admin {update.effective_user.id} edited plan {plan_id}: {kwargs} (ok={ok})")
+
+    if not ok:
+        await update.message.reply_text("❌ Could not update plan (it may have been deleted).", reply_markup=get_main_menu())
+        return ConversationHandler.END
+
+    text2, reply_markup2 = _plan_edit_text_and_keyboard(plan_id)
+    if text2 is None:
+        # Plan vanished between the update and re-rendering this screen (very
+        # unlikely) - fall back to the main menu rather than showing nothing.
+        await update.message.reply_text("✅ Plan updated!", reply_markup=get_main_menu())
+        return ConversationHandler.END
+
+    await update.message.reply_text(f"✅ Plan updated!\n\n{text2}", reply_markup=reply_markup2)
+    return ConversationHandler.END
 
 
 # ====================== Add plan (step-by-step wizard) ======================
@@ -659,6 +885,47 @@ async def admin_plan_add_maxtabs_input(update: Update, context: ContextTypes.DEF
         await update.message.reply_text("❌ Please send a valid positive number, or tap Cancel.", reply_markup=_cancel_kb())
         return ADMIN_PLAN_ADD_MAXTABS
     context.user_data["admin_new_plan"]["max_tabs"] = int(text)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Yes", callback_data="admin_plan_add_sftp_yes")],
+        [InlineKeyboardButton("🔒 No", callback_data="admin_plan_add_sftp_no")],
+    ])
+    await update.message.reply_text(
+        "🗄 Should this plan include the SFTP file browser?", reply_markup=keyboard,
+    )
+    return ADMIN_PLAN_ADD_SFTP
+
+
+async def admin_plan_add_sftp_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["admin_new_plan"]["sftp_enabled"] = query.data == "admin_plan_add_sftp_yes"
+    await _edit_then_prompt_cancel(
+        query, "⏱ Max SSH session length in minutes (send 0 for unlimited):"
+    )
+    return ADMIN_PLAN_ADD_TIMEOUT
+
+
+async def admin_plan_add_timeout_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if not text.isdigit():
+        await update.message.reply_text("❌ Please send a whole number (0 for unlimited), or tap Cancel.", reply_markup=_cancel_kb())
+        return ADMIN_PLAN_ADD_TIMEOUT
+    minutes = int(text)
+    context.user_data["admin_new_plan"]["session_timeout_minutes"] = minutes if minutes > 0 else None
+    await update.message.reply_text(
+        "⚙️ Max number of automation (scheduled) jobs on this plan (send 0 for unlimited):",
+        reply_markup=_cancel_kb(),
+    )
+    return ADMIN_PLAN_ADD_MAXAUTO
+
+
+async def admin_plan_add_maxauto_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if not text.isdigit():
+        await update.message.reply_text("❌ Please send a whole number (0 for unlimited), or tap Cancel.", reply_markup=_cancel_kb())
+        return ADMIN_PLAN_ADD_MAXAUTO
+    count = int(text)
+    context.user_data["admin_new_plan"]["max_automations"] = count if count > 0 else None
     await update.message.reply_text(
         "📝 Send a short description, or \"-\" to skip:", reply_markup=_cancel_kb()
     )
@@ -668,22 +935,37 @@ async def admin_plan_add_maxtabs_input(update: Update, context: ContextTypes.DEF
 async def admin_plan_add_desc_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     description = "" if text == "-" else text
-
     data = context.user_data.pop("admin_new_plan", {})
+    data["description"] = description
+    if not data.get("name"):
+        await update.message.reply_text("❌ Something went wrong, please start again.", reply_markup=get_main_menu())
+        return ConversationHandler.END
+
     plan_id = subscription.add_plan(
         name=data["name"],
         price=data["price"],
         days=data["days"],
         max_servers=data["max_servers"],
         max_tabs=data["max_tabs"],
-        description=description,
+        description=data.get("description", ""),
+        sftp_enabled=data.get("sftp_enabled", True),
+        session_timeout_minutes=data.get("session_timeout_minutes"),
+        max_automations=data.get("max_automations"),
     )
     logger.info(f"Admin {update.effective_user.id} added plan {plan_id}: {data}")
 
+    sftp_flag = "✅" if data.get("sftp_enabled", True) else "🔒"
+    timeout = data.get("session_timeout_minutes")
+    timeout_txt = f"{timeout}m" if timeout else "∞"
+    max_auto = data.get("max_automations")
+    max_auto_txt = str(max_auto) if max_auto is not None else "∞"
+    price_txt = "Free" if data["price"] == 0 else f"{data['price']:,} / {data['days']}d"
     await update.message.reply_text(
         f"✅ Plan added!\n\n"
-        f"📦 {data['name']} - {data['price']:,} / {data['days']}d "
-        f"(🖥{data['max_servers']} 📑{data['max_tabs']})",
+        f"📦 {data['name']} - {price_txt} "
+        f"(🖥{data['max_servers']} 📑{data['max_tabs']} 🗄{sftp_flag} ⏱{timeout_txt} ⚙️{max_auto_txt})\n\n"
+        f"🆓 New users are auto-granted whichever active plan is cheapest - "
+        f"no extra step needed if this one's meant to be that.",
         reply_markup=get_main_menu(),
     )
     return ConversationHandler.END

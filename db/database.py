@@ -1,22 +1,6 @@
 """
 db/database.py
-===============
-PostgreSQL-backed storage for everything that used to live in flat JSON
-files (bot_settings.py's sponsor/card/health settings are NOT part of this -
-those stay JSON, see bot_settings.py's own comments). This module owns:
 
-  * users            - one row per Telegram user who has ever hit /start
-  * plans             - admin-managed subscription plans
-  * subscriptions     - each user's currently active plan (1 row per user)
-  * wallet_transactions - append-only ledger backing each user's balance
-  * payment_requests  - card-to-card payments awaiting admin approval
-                         (previously an in-memory dict in subscription.py -
-                         moving it here means a bot restart no longer loses
-                         pending requests)
-
-Modeled on the connection-handling pattern from the nomone.py sample's
-database.py (lazy connect/reconnect, RealDictCursor, explicit commit/
-rollback), trimmed down to the tables this bot actually needs.
 """
 import logging
 import uuid
@@ -36,6 +20,7 @@ class Database:
         self.conn = None
         self.connect()
         self._create_tables()
+        self._seed_default_plans()
 
     # ------------------------------------------------------------------
     # Connection handling
@@ -114,9 +99,24 @@ class Database:
                     max_tabs INTEGER NOT NULL,
                     enabled BOOLEAN DEFAULT TRUE,
                     plan_order INTEGER DEFAULT 0,
+                    is_default BOOLEAN DEFAULT FALSE,
+                    sftp_enabled BOOLEAN DEFAULT TRUE,
+                    session_timeout_minutes INTEGER,
+                    max_automations INTEGER,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            # Upgrade path: bots that already had a `plans` table before
+            # these columns existed won't get them from CREATE TABLE IF NOT
+            # EXISTS above, so add them explicitly too - safe/no-op on a
+            # fresh install where the columns were just created.
+            # session_timeout_minutes / max_automations are NULL = unlimited
+            # (no cap) - that's the correct meaning for every pre-existing
+            # paid plan that predates this feature.
+            cur.execute("ALTER TABLE plans ADD COLUMN IF NOT EXISTS is_default BOOLEAN DEFAULT FALSE")
+            cur.execute("ALTER TABLE plans ADD COLUMN IF NOT EXISTS sftp_enabled BOOLEAN DEFAULT TRUE")
+            cur.execute("ALTER TABLE plans ADD COLUMN IF NOT EXISTS session_timeout_minutes INTEGER")
+            cur.execute("ALTER TABLE plans ADD COLUMN IF NOT EXISTS max_automations INTEGER")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS subscriptions (
                     user_id BIGINT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
@@ -124,10 +124,16 @@ class Database:
                     plan_name VARCHAR(255),
                     max_servers INTEGER,
                     max_tabs INTEGER,
+                    sftp_enabled BOOLEAN DEFAULT TRUE,
+                    session_timeout_minutes INTEGER,
+                    max_automations INTEGER,
                     granted_at TIMESTAMP,
                     expires_at TIMESTAMP
                 )
             """)
+            cur.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS sftp_enabled BOOLEAN DEFAULT TRUE")
+            cur.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS session_timeout_minutes INTEGER")
+            cur.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS max_automations INTEGER")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS wallet_transactions (
                     id SERIAL PRIMARY KEY,
@@ -318,20 +324,40 @@ class Database:
         row = self._execute("SELECT * FROM plans WHERE id = %s", (plan_id,), fetch="one")
         return self._plan_dict(row) if row else None
 
-    def add_plan(self, name: str, price: int, days: int, max_servers: int, max_tabs: int, description: str = "") -> str:
+    def get_default_plan(self):
+        """The plan auto-granted to every new user. There's nothing for an
+        admin to pick here: it's always the cheapest enabled plan (in
+        practice the free plan, price 0) - ties broken by plan_order."""
+        row = self._execute(
+            "SELECT * FROM plans WHERE enabled = TRUE ORDER BY price ASC, plan_order ASC LIMIT 1",
+            fetch="one",
+        )
+        return self._plan_dict(row) if row else None
+
+    def add_plan(self, name: str, price: int, days: int, max_servers: int, max_tabs: int,
+                 description: str = "", sftp_enabled: bool = True,
+                 session_timeout_minutes: int = None, max_automations: int = None) -> str:
+        """sftp_enabled=False disables the SFTP file browser entirely for
+        this plan. session_timeout_minutes/max_automations are None =
+        unlimited; pass an int to cap total SSH session length (minutes)
+        or the number of scheduled automation jobs a user on this plan
+        may have at once."""
         plan_id = uuid.uuid4().hex[:8]
         row = self._execute("SELECT COALESCE(MAX(plan_order), 0) AS m FROM plans", fetch="one")
         order = (row["m"] if row else 0) + 1
         self._execute(
-            """INSERT INTO plans (id, name, description, price, days, max_servers, max_tabs, enabled, plan_order)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE, %s)""",
+            """INSERT INTO plans (id, name, description, price, days, max_servers, max_tabs, enabled,
+                                   plan_order, sftp_enabled, session_timeout_minutes, max_automations)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE, %s, %s, %s, %s)""",
             (plan_id, name.strip(), (description or "").strip(), int(price), int(days),
-             int(max_servers), int(max_tabs), order),
+             int(max_servers), int(max_tabs), order, bool(sftp_enabled),
+             session_timeout_minutes, max_automations),
         )
         return plan_id
 
     def update_plan(self, plan_id: str, **kwargs) -> bool:
-        allowed = {"name", "description", "price", "days", "max_servers", "max_tabs", "enabled"}
+        allowed = {"name", "description", "price", "days", "max_servers", "max_tabs", "enabled",
+                   "sftp_enabled", "session_timeout_minutes", "max_automations"}
         fields, values = [], []
         for key, value in kwargs.items():
             if key == "order":
@@ -357,6 +383,61 @@ class Database:
     def delete_plan(self, plan_id: str) -> bool:
         row = self._execute("DELETE FROM plans WHERE id = %s RETURNING id", (plan_id,), fetch="one")
         return row is not None
+
+    def _seed_default_plans(self):
+        """Runs once, only the very first time the bot connects to an empty
+        `plans` table (fresh install) - seeds a free Basic plan (auto-granted
+        to every new user, see grant_default_plan_if_needed() below) plus
+        three paid tiers sized around this bot's actual limits (concurrent
+        servers / terminal tabs). Never overwrites or re-seeds if an admin
+        has already created/edited/deleted plans, since we only act when the
+        table is completely empty."""
+        try:
+            existing = self._execute("SELECT COUNT(*) AS c FROM plans", fetch="one")
+            if existing and int(existing["c"]) > 0:
+                return
+            self.add_plan(
+                name="Free Basic", price=0, days=36500, max_servers=1, max_tabs=1,
+                description=(
+                    "Always-on free plan: manage 1 server with 1 terminal session at a time. "
+                    "SSH sessions auto-close after 15 minutes; SFTP file browser is not included; "
+                    "1 automation job max."
+                ),
+                sftp_enabled=False, session_timeout_minutes=15, max_automations=1,
+            )
+            self.add_plan(
+                name="Starter", price=150000, days=30, max_servers=3, max_tabs=2,
+                description="For small setups: up to 3 servers, 2 terminal sessions at once.",
+            )
+            self.add_plan(
+                name="Pro", price=300000, days=30, max_servers=7, max_tabs=4,
+                description="For growing setups: up to 7 servers, 4 terminal sessions at once, health monitoring.",
+            )
+            self.add_plan(
+                name="Business", price=500000, days=30, max_servers=15, max_tabs=8,
+                description="For teams: up to 15 servers, 8 terminal sessions at once, priority support.",
+            )
+            logger.info("✅ Seeded default plans (Free Basic + Starter/Pro/Business)")
+        except Exception as e:
+            logger.error(f"❌ Error seeding default plans: {e}")
+
+    def grant_default_plan_if_needed(self, user_id) -> bool:
+        """Call after registering/refreshing a user (e.g. on /start). If they
+        have no currently-active subscription and a default plan is
+        configured, silently grants it so every user always has at least
+        baseline free access - without touching anyone who already has an
+        active (free or paid) plan running."""
+        try:
+            if self.is_active(user_id):
+                return False
+            plan = self.get_default_plan()
+            if not plan:
+                return False
+            self.grant_subscription(user_id, plan)
+            return True
+        except Exception as e:
+            logger.error(f"❌ Error granting default plan to user {user_id}: {e}")
+            return False
 
     # ==================================================================
     # 4. SUBSCRIPTIONS
@@ -396,6 +477,26 @@ class Database:
         sub = self.get_subscription(user_id)
         return sub.get("max_servers", 0), sub.get("max_tabs", 0)
 
+    def get_capabilities(self, user_id) -> dict:
+        """Full set of plan-enforced limits/toggles for a user, snapshotted
+        onto their subscriptions row at grant time (see grant_subscription).
+        session_timeout_minutes/max_automations of None mean "unlimited" -
+        callers should treat None as no cap, not as zero. With no active
+        subscription every capability is closed/zeroed out."""
+        if not self.is_active(user_id):
+            return {
+                "max_servers": 0, "max_tabs": 0, "sftp_enabled": False,
+                "session_timeout_minutes": 0, "max_automations": 0,
+            }
+        sub = self.get_subscription(user_id)
+        return {
+            "max_servers": sub.get("max_servers", 0),
+            "max_tabs": sub.get("max_tabs", 0),
+            "sftp_enabled": bool(sub.get("sftp_enabled", True)),
+            "session_timeout_minutes": sub.get("session_timeout_minutes"),
+            "max_automations": sub.get("max_automations"),
+        }
+
     def grant_subscription(self, user_id, plan: dict) -> dict:
         """Activates `plan` for the user. Remaining time on an existing
         active subscription is added on top of the new plan's `days`
@@ -417,17 +518,24 @@ class Database:
 
         self._execute(
             """
-            INSERT INTO subscriptions (user_id, plan_id, plan_name, max_servers, max_tabs, granted_at, expires_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO subscriptions (user_id, plan_id, plan_name, max_servers, max_tabs,
+                                        sftp_enabled, session_timeout_minutes, max_automations,
+                                        granted_at, expires_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (user_id) DO UPDATE SET
                 plan_id = EXCLUDED.plan_id,
                 plan_name = EXCLUDED.plan_name,
                 max_servers = EXCLUDED.max_servers,
                 max_tabs = EXCLUDED.max_tabs,
+                sftp_enabled = EXCLUDED.sftp_enabled,
+                session_timeout_minutes = EXCLUDED.session_timeout_minutes,
+                max_automations = EXCLUDED.max_automations,
                 granted_at = EXCLUDED.granted_at,
                 expires_at = EXCLUDED.expires_at
             """,
-            (user_id, plan["id"], plan["name"], int(plan["max_servers"]), int(plan["max_tabs"]), now, expires_at),
+            (user_id, plan["id"], plan["name"], int(plan["max_servers"]), int(plan["max_tabs"]),
+             bool(plan.get("sftp_enabled", True)), plan.get("session_timeout_minutes"),
+             plan.get("max_automations"), now, expires_at),
         )
         return self.get_subscription(user_id)
 

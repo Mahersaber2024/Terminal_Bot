@@ -1,21 +1,5 @@
 """
 subscription.py
-================
-Everything related to paid access to the bot, in one file:
-
-  1. Plans        - admin-managed plans (name, price, days, max_servers, max_tabs)
-  2. Wallet        - per-user balance + transaction history
-  3. Subscriptions - which plan each user currently has active, and until when
-  4. Payments      - the user-facing buy/top-up flow (pay with wallet, or
-                      card-to-card with admin DM approval), modeled on the
-                      wallet/card-to-card pattern in the nomone.py sample
-                      (pay_with_wallet / pay_with_card / admin_approve_payment).
-
-Storage: PostgreSQL via db.get_db() (see db/database.py) - plans, wallet
-balances/transactions, subscriptions, and pending card-to-card payment
-requests all live in the database now, not flat JSON files. Function
-signatures are unchanged from the previous JSON-backed version, so nothing
-else in the bot (admin.py, main.py) needed to change.
 """
 import logging
 import uuid
@@ -43,12 +27,36 @@ def get_plan(plan_id: str):
     return get_db().get_plan(plan_id)
 
 
-def add_plan(name: str, price: int, days: int, max_servers: int, max_tabs: int, description: str = "") -> str:
-    return get_db().add_plan(name, price, days, max_servers, max_tabs, description)
+def get_default_plan():
+    """The plan (if any) currently marked to be auto-granted to new users."""
+    return get_db().get_default_plan()
+
+
+def set_default_plan(plan_id: str) -> bool:
+    """Marks `plan_id` as the one auto-granted to new users; unmarks any
+    previous default (only one plan can be default at a time)."""
+    return get_db().set_default_plan(plan_id)
+
+
+def add_plan(name: str, price: int, days: int, max_servers: int, max_tabs: int,
+             description: str = "", is_default: bool = False, sftp_enabled: bool = True,
+             session_timeout_minutes: int = None, max_automations: int = None) -> str:
+    return get_db().add_plan(
+        name, price, days, max_servers, max_tabs, description, is_default=is_default,
+        sftp_enabled=sftp_enabled, session_timeout_minutes=session_timeout_minutes,
+        max_automations=max_automations,
+    )
 
 
 def update_plan(plan_id: str, **kwargs) -> bool:
     return get_db().update_plan(plan_id, **kwargs)
+
+
+def ensure_default_plan(user_id) -> bool:
+    """Call this after registering/refreshing a user (e.g. on /start). Grants
+    the configured default (free) plan if the user doesn't currently have an
+    active subscription. Returns True if a plan was just granted."""
+    return get_db().grant_default_plan_if_needed(user_id)
 
 
 def toggle_plan(plan_id: str) -> bool:
@@ -106,6 +114,14 @@ def get_limits(user_id):
     return get_db().get_limits(user_id)
 
 
+def get_capabilities(user_id) -> dict:
+    """Full plan-enforced capability dict for the user's active plan:
+    {max_servers, max_tabs, sftp_enabled, session_timeout_minutes, max_automations}.
+    session_timeout_minutes/max_automations of None mean unlimited. Every
+    value is closed/zeroed if the user has no active subscription."""
+    return get_db().get_capabilities(user_id)
+
+
 def grant_subscription(user_id, plan: dict) -> dict:
     """Activates `plan` for the user. If they already have time left on a
     current subscription, that remaining time is added on top of the new
@@ -150,6 +166,20 @@ def _uid(update: Update) -> int:
 
 # ---- subscription status menu ----
 
+def _capability_lines(d: dict) -> list:
+    """Shared formatting for the SFTP / session-timeout / automation flags,
+    used by both the subscription status screen and a plan's buy-detail
+    screen. `d` can be a subscription row or a plan dict - both use the
+    same key names (sftp_enabled, session_timeout_minutes, max_automations)."""
+    lines = []
+    lines.append("🗄 SFTP file browser: " + ("✅ included" if d.get("sftp_enabled", True) else "🔒 not included"))
+    timeout = d.get("session_timeout_minutes")
+    lines.append(f"⏱ SSH session length: {timeout} min" if timeout else "⏱ SSH session length: unlimited")
+    max_auto = d.get("max_automations")
+    lines.append(f"⚙️ Automation jobs: up to {max_auto}" if max_auto is not None else "⚙️ Automation jobs: unlimited")
+    return lines
+
+
 def _status_text(user_id) -> str:
     balance = get_balance(user_id)
     lines = ["💳 *Subscription*\n"]
@@ -160,6 +190,7 @@ def _status_text(user_id) -> str:
         lines.append(f"⏳ Expires in: {days} day(s)")
         lines.append(f"🖥 Server limit: {sub['max_servers']}")
         lines.append(f"📑 Tab limit: {sub['max_tabs']}")
+        lines.extend(_capability_lines(sub))
     else:
         lines.append("❌ No active subscription.")
         lines.append("You need an active plan to use Server Manager.")
@@ -229,6 +260,7 @@ def _plan_detail_text(plan: dict) -> str:
     lines.append(f"⏳ Duration: {plan['days']} day(s)")
     lines.append(f"🖥 Max servers: {plan['max_servers']}")
     lines.append(f"📑 Max concurrent tabs: {plan['max_tabs']}")
+    lines.extend(_capability_lines(plan))
     return "\n".join(lines)
 
 

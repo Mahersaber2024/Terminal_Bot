@@ -91,6 +91,7 @@ ADD_LABEL_DEFAULT_CB = "servermgr_addlabel_default"
 
 # Live "terminal" view while a command is streaming
 CMD_CANCEL_CALLBACK = "servermgr_cmdcancel"
+CMD_ENTER_CALLBACK = "servermgr_cmdenter"
 TERMINAL_EDIT_INTERVAL = 1.2   # min seconds between Telegram message edits (stay well under rate limits)
 TERMINAL_MAX_IDLE_EDIT = 4.0   # force a heartbeat edit at least this often even with no new output
 TERMINAL_BODY_CHARS = 3200     # tail of output kept inside the code block (Telegram caps messages at 4096 chars)
@@ -201,10 +202,13 @@ def _tabs_keyboard_rows(sessions: dict, active_id: str) -> list:
 def _terminal_keyboard(sessions: dict, active_id: str, session_id: str = None) -> InlineKeyboardMarkup:
     """The single keyboard attached to every terminal message: tab switcher/closer
     rows plus, when session_id is given (i.e. this message belongs to an actual
-    command run), a Cancel row for that specific tab's command."""
+    command run), a Cancel + Enter row for that specific tab's command."""
     rows = _tabs_keyboard_rows(sessions, active_id)
     if session_id:
-        rows.append([InlineKeyboardButton("❌ Cancel", callback_data=f"{CMD_CANCEL_CALLBACK}_{session_id}")])
+        rows.append([
+            InlineKeyboardButton("❌ Cancel", callback_data=f"{CMD_CANCEL_CALLBACK}_{session_id}"),
+            InlineKeyboardButton("⏎ Enter", callback_data=f"{CMD_ENTER_CALLBACK}_{session_id}"),
+        ])
     return InlineKeyboardMarkup(rows)
 
 
@@ -341,8 +345,27 @@ def _format_terminal(label: str, command: str, output: str, status_line: str) ->
     body = body[-TERMINAL_BODY_CHARS:]
     if len(output) > TERMINAL_BODY_CHARS:
         body = "…(older output trimmed)…\n" + body
+    # Extra blank line before the closing fence: some Telegram clients render
+    # the very last line of a code block flush against the box's bottom edge,
+    # so while output is still streaming in (frequent live edits) that last
+    # real line can look clipped/hidden until the next edit lands. A blank
+    # line gives it breathing room so it's always fully visible. rstrip first
+    # so raw output that already ends in blank lines doesn't stack up extra gaps.
+    body = body.rstrip("\n")
     header += f"\n`$ {command}`"
-    return f"{header}\n```\n{body}\n```\n{status_line}"
+    return f"{header}\n```\n{body}\n\n```\n{status_line}"
+
+
+def _cancel_session_timeout(session: dict):
+    """Cancels the plan-enforced auto-close job for a session (see
+    _schedule_session_timeout), if one was scheduled - always safe to call
+    even when there is none."""
+    job = session.get("timeout_job")
+    if job is not None:
+        try:
+            job.schedule_removal()
+        except Exception:
+            pass
 
 
 def _close_one_session(context: ContextTypes.DEFAULT_TYPE, session_id: str):
@@ -351,6 +374,7 @@ def _close_one_session(context: ContextTypes.DEFAULT_TYPE, session_id: str):
     session = sessions.pop(session_id, None)
     if session is None:
         return
+    _cancel_session_timeout(session)
     engine.close_shell(session.get("channel"))
     client = session.get("client")
     if client is not None:
@@ -365,6 +389,7 @@ def _close_ssh_session(context: ContextTypes.DEFAULT_TYPE):
     sessions = context.user_data.pop("servermgr_sessions", {}) or {}
     for session_id in list(sessions.keys()):
         session = sessions[session_id]
+        _cancel_session_timeout(session)
         engine.close_shell(session.get("channel"))
         client = session.get("client")
         if client is not None:
@@ -411,6 +436,42 @@ def _do_close_tab(context: ContextTypes.DEFAULT_TYPE, session_id: str):
         "label": label, "server_id": server_id,
         "sessions": sessions, "active_id": context.user_data.get("servermgr_active_session"),
     }
+
+
+async def _session_timeout_tick(context: ContextTypes.DEFAULT_TYPE):
+    """Fired once by the job scheduled in _schedule_session_timeout - auto-closes
+    a single SSH tab after a plan's session_timeout_minutes has elapsed, even if
+    it's still in active use (a hard cap on total session length, not an idle
+    timeout). No-ops if the tab was already closed by the user in the meantime."""
+    job = context.job
+    session_id = job.data["session_id"]
+    sessions = context.user_data.get("servermgr_sessions", {})
+    if session_id not in sessions:
+        return
+    label = sessions[session_id].get("label", "")
+    _do_close_tab(context, session_id)
+    try:
+        await context.bot.send_message(
+            chat_id=job.chat_id,
+            text=f"⏱ Your session on \"{label}\" was auto-closed - your plan's session time limit was reached.",
+        )
+    except Exception:
+        pass
+
+
+def _schedule_session_timeout(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int,
+                               session_id: str, minutes):
+    """Schedules the one-off auto-close job for a freshly opened SSH tab, per
+    the user's plan session_timeout_minutes (None/0 = unlimited, nothing
+    scheduled). Returns the Job so the caller can stash it on the session
+    dict for cancellation if the tab is closed manually first - see
+    _cancel_session_timeout."""
+    if not minutes or context.job_queue is None:
+        return None
+    return context.job_queue.run_once(
+        _session_timeout_tick, when=int(minutes) * 60, chat_id=chat_id, user_id=user_id,
+        data={"session_id": session_id}, name=f"servermgr_timeout_{user_id}_{session_id}",
+    )
 
 
 def _cmd_state_or_end(context: ContextTypes.DEFAULT_TYPE):
@@ -513,7 +574,7 @@ def _servers_text_and_keyboard(user_id, sessions: dict = None):
     return text, InlineKeyboardMarkup(keyboard)
 
 
-def _server_detail_text_and_keyboard(server: dict, sessions: dict = None, active_id: str = None):
+def _server_detail_text_and_keyboard(server: dict, sessions: dict = None, active_id: str = None, user_id=None):
     auth_line = "📄 SSH Key" if server.get("private_key") else "🔑 Password"
     sessions = sessions or {}
     own_sessions = [(sid, s) for sid, s in sessions.items() if s["server_id"] == server["id"]]
@@ -538,7 +599,9 @@ def _server_detail_text_and_keyboard(server: dict, sessions: dict = None, active
     if len(sessions) < MAX_SESSIONS:
         run_label = "💻 Open Another Tab" if own_sessions else "💻 Run Command (SSH)"
         rows.append([InlineKeyboardButton(run_label, callback_data=f"servermgr_ssh_start_{server['id']}")])
-    rows.append([InlineKeyboardButton("🗄 Open SFTP", callback_data=f"{FILES_START_CB_PREFIX}{server['id']}")])
+    sftp_enabled = subscription.get_capabilities(user_id).get("sftp_enabled", True) if user_id is not None else True
+    sftp_label = "🗄 Open SFTP" if sftp_enabled else "🔒 Open SFTP (upgrade to unlock)"
+    rows.append([InlineKeyboardButton(sftp_label, callback_data=f"{FILES_START_CB_PREFIX}{server['id']}")])
     monitor_on = server.get("monitor_enabled", True)
     rows.append([
         InlineKeyboardButton("🩺 Health Check", callback_data=f"{HEALTH_CHECK_CB_PREFIX}{server['id']}"),
@@ -621,7 +684,7 @@ async def servermgr_srv_detail(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text("❌ Server not found.", reply_markup=reply_markup)
         return
     active_id = context.user_data.get("servermgr_active_session")
-    text, reply_markup = _server_detail_text_and_keyboard(server, sessions, active_id)
+    text, reply_markup = _server_detail_text_and_keyboard(server, sessions, active_id, user_id=query.from_user.id)
     await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
 
 
@@ -649,10 +712,13 @@ async def servermgr_health_check(update: Update, context: ContextTypes.DEFAULT_T
     else:
         text = health.format_health_text(server["label"], snapshot)
 
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔄 Restart", callback_data=f"{HEALTH_RESTART_CB_PREFIX}{server['id']}"),
-        InlineKeyboardButton("🧹 Cleanup", callback_data=f"{HEALTH_CLEANUP_CB_PREFIX}{server['id']}"),
-    ]])
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔄 Restart", callback_data=f"{HEALTH_RESTART_CB_PREFIX}{server['id']}"),
+            InlineKeyboardButton("🧹 Cleanup", callback_data=f"{HEALTH_CLEANUP_CB_PREFIX}{server['id']}"),
+        ],
+        [InlineKeyboardButton("🔙 Back", callback_data=f"servermgr_srv_{server['id']}")],
+    ])
     await context.bot.send_message(
         chat_id=query.message.chat_id, text=text, parse_mode="Markdown", reply_markup=keyboard,
     )
@@ -673,7 +739,7 @@ async def servermgr_health_toggle(update: Update, context: ContextTypes.DEFAULT_
     server = settings.get_server(query.from_user.id, server_id)
     sessions = context.user_data.get("servermgr_sessions", {})
     active_id = context.user_data.get("servermgr_active_session")
-    text, reply_markup = _server_detail_text_and_keyboard(server, sessions, active_id)
+    text, reply_markup = _server_detail_text_and_keyboard(server, sessions, active_id, user_id=query.from_user.id)
     await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
 
 
@@ -717,10 +783,11 @@ async def servermgr_restart_execute(update: Update, context: ContextTypes.DEFAUL
     else:
         text = f"🔄 \"{server['label']}\" is rebooting now. Give it a minute, then run a Health Check to confirm it's back."
 
+    back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"servermgr_srv_{server_id}")]])
     try:
-        await query.edit_message_text(text)
+        await query.edit_message_text(text, reply_markup=back_kb)
     except Exception:
-        await context.bot.send_message(chat_id=query.message.chat_id, text=text)
+        await context.bot.send_message(chat_id=query.message.chat_id, text=text, reply_markup=back_kb)
 
 
 # ====================== Cleanup - safe (logs/caches/tmp only), so it runs immediately with no confirmation ======================
@@ -746,10 +813,11 @@ async def servermgr_cleanup_execute(update: Update, context: ContextTypes.DEFAUL
         freed_mb = round((result.get("freed_bytes") or 0) / (1024 * 1024), 1)
         text = f"🧹 Cleanup finished on \"{server['label']}\" — approximately {freed_mb}MB freed."
 
+    back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"servermgr_srv_{server_id}")]])
     try:
-        await query.edit_message_text(text)
+        await query.edit_message_text(text, reply_markup=back_kb)
     except Exception:
-        await context.bot.send_message(chat_id=query.message.chat_id, text=text)
+        await context.bot.send_message(chat_id=query.message.chat_id, text=text, reply_markup=back_kb)
 
 
 # ====================== Quick ping (no server registration needed) ======================
@@ -1132,7 +1200,7 @@ async def servermgr_trustkey_confirm(update: Update, context: ContextTypes.DEFAU
     engine.forget_host_key(server["host"], server.get("port", 22))
     await query.answer("✅ Old key forgotten.")
     sessions = context.user_data.get("servermgr_sessions", {})
-    text, reply_markup = _server_detail_text_and_keyboard(server, sessions, context.user_data.get("servermgr_active_session"))
+    text, reply_markup = _server_detail_text_and_keyboard(server, sessions, context.user_data.get("servermgr_active_session"), user_id=query.from_user.id)
     await query.edit_message_text(
         f"✅ The old host key for \"{server['label']}\" was removed. Tap \"Run Command (SSH)\" "
         f"again to reconnect - the new key will be pinned at that point.",
@@ -1268,6 +1336,14 @@ async def servermgr_files_start(update: Update, context: ContextTypes.DEFAULT_TY
 
     if not subscription.is_active(user_id):
         await query.answer("🔒 Your subscription has expired. Please renew it first.", show_alert=True)
+        return ConversationHandler.END
+
+    if not subscription.get_capabilities(user_id).get("sftp_enabled"):
+        await query.answer(
+            "🔒 The SFTP file browser isn't included in your current plan. "
+            "Upgrade from 💳 Subscription to unlock it.",
+            show_alert=True,
+        )
         return ConversationHandler.END
 
     if not server:
@@ -2031,11 +2107,18 @@ async def servermgr_ssh_start(update: Update, context: ContextTypes.DEFAULT_TYPE
         "busy": False,
         "term_state": None,
         "tab_state_msg": None,
+        "timeout_job": None,
     }
     context.user_data["servermgr_active_session"] = session_id
 
+    timeout_minutes = subscription.get_capabilities(user_id).get("session_timeout_minutes")
+    sessions[session_id]["timeout_job"] = _schedule_session_timeout(
+        context, query.message.chat_id, user_id, session_id, timeout_minutes
+    )
+    timeout_note = f" Auto-closes in {timeout_minutes} min (your plan's limit)." if timeout_minutes else ""
+
     await query.edit_message_text(
-        f"💻 Connected to \"{server['label']}\" ({server['host']}) — tab {len(sessions)}/{tab_limit}.",
+        f"💻 Connected to \"{server['label']}\" ({server['host']}) — tab {len(sessions)}/{tab_limit}.{timeout_note}",
     )
     await context.bot.send_message(
         chat_id=query.message.chat_id,
@@ -2061,7 +2144,7 @@ async def servermgr_switch_tab(update: Update, context: ContextTypes.DEFAULT_TYP
 
     server = settings.get_server(query.from_user.id, session["server_id"])
     if server:
-        text, reply_markup = _server_detail_text_and_keyboard(server, sessions, session_id)
+        text, reply_markup = _server_detail_text_and_keyboard(server, sessions, session_id, user_id=query.from_user.id)
         try:
             await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
         except Exception:
@@ -2090,7 +2173,7 @@ async def servermgr_closetab(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     server = settings.get_server(query.from_user.id, result["server_id"])
     if server:
-        text, reply_markup = _server_detail_text_and_keyboard(server, result["sessions"], result["active_id"])
+        text, reply_markup = _server_detail_text_and_keyboard(server, result["sessions"], result["active_id"], user_id=query.from_user.id)
         try:
             await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
         except Exception:
@@ -2180,10 +2263,13 @@ async def servermgr_tabsbar_close(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def servermgr_cmd_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Routes a typed command to the *active* tab. Kicks off the streaming/execution
-    as a detached background task and returns right away, so other tabs stay
-    responsive (commands can run in more than one tab at the same time) instead of
-    the whole conversation being stuck waiting for this one command to finish."""
+    """Routes a typed line to the *active* tab. If nothing is running there, kicks
+    off a fresh command as a detached background task and returns right away, so
+    other tabs stay responsive (commands can run in more than one tab at the same
+    time) instead of the whole conversation being stuck waiting for this one
+    command to finish. If something IS already running/prompting there, forwards
+    the line straight into that channel instead (see the `busy` branch below) -
+    that's what lets the user answer an interactive installer's prompts."""
     text = (update.message.text or "").strip()
     sessions = context.user_data.get("servermgr_sessions", {})
     active_id = context.user_data.get("servermgr_active_session")
@@ -2200,10 +2286,27 @@ async def servermgr_cmd_input(update: Update, context: ContextTypes.DEFAULT_TYPE
         return SERVERMGR_CMD_INPUT
 
     if session.get("busy"):
-        await update.message.reply_text(
-            f"⏳ A command is still running in \"{session['label']}\". Wait for it to finish, or open another "
-            f"server's page to switch to (or open) a different tab in the meantime."
-        )
+        handle_box = session.get("cmd_handle_box")
+        handle = handle_box.get("handle") if handle_box else None
+        if handle is None:
+            # cmd_handle_box is populated the instant _stream_command's background
+            # task starts (see on_chunk's first, empty call in engine.run_shell_input) -
+            # this only happens in the sub-second window before that, so just ask
+            # for a retry rather than swallowing the message.
+            await update.message.reply_text(
+                f"⏳ \"{session['label']}\" is still starting up - try again in a second."
+            )
+            return SERVERMGR_CMD_INPUT
+        # Something is already running/prompting in this tab (an installer menu, a
+        # pager, a "y/n" confirmation, ...) - feed this line straight into it, the
+        # same way the ⏎ Enter button does, instead of queuing it as a brand new
+        # command. This is what lets the user answer an interactive prompt
+        # mid-script: the already-running _stream_command task keeps streaming
+        # whatever comes back into the same terminal message on its own.
+        if not handle.send_raw(text + "\n"):
+            await update.message.reply_text(
+                f"⚠️ Could not send that to \"{session['label']}\" - the session may have dropped."
+            )
         return SERVERMGR_CMD_INPUT
 
     server = settings.get_server(_uid(update), session["server_id"])
@@ -2306,7 +2409,7 @@ async def _stream_command(context: ContextTypes.DEFAULT_TYPE, session_id: str, c
     session["term_state"] = term_state
 
     task = asyncio.create_task(
-        asyncio.to_thread(engine.run_shell_input, channel, command_text, COMMAND_TIMEOUT, engine.SHELL_QUIET_SECONDS, on_chunk)
+        asyncio.to_thread(engine.run_shell_input, channel, command_text, COMMAND_TIMEOUT, on_chunk)
     )
 
     output_so_far = ""
@@ -2405,52 +2508,30 @@ async def _stream_command(context: ContextTypes.DEFAULT_TYPE, session_id: str, c
     term_state["status"] = status
 
 
-async def servermgr_cmd_cancel_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    session_id = query.data.replace(f"{CMD_CANCEL_CALLBACK}_", "", 1)
-    sessions = context.user_data.get("servermgr_sessions", {})
-    session = sessions.get(session_id)
-    if session is None:
-        await query.answer("That tab is no longer open.")
-        return
-
-    handle_box = session.get("cmd_handle_box")
-    handle = handle_box.get("handle") if handle_box else None
-    if handle is not None:
-        # A command is actively streaming in this tab - cancel it the normal way.
-        session["cancel_requested"] = True
-        handle.cancel()
-        await query.answer("🛑 Cancelling…")
-        return
-
-    # No command is currently running in this tab (the button is shown at all times -
-    # see _stream_command()'s final edit above), but the shell session is still open,
-    # so send Ctrl-C straight to it - e.g. to break out of a stuck foreground program
-    # or an interactive menu the user no longer wants.
+async def _inject_idle_keystroke(context: ContextTypes.DEFAULT_TYPE, session: dict, session_id: str, data: str, status_text: str) -> bool:
+    """Sends raw bytes (Ctrl-C, a bare Enter, ...) into a tab's shell when no
+    command is actively streaming, then folds whatever comes back (an echoed
+    ^C, a fresh prompt, a pager redrawing a page, ...) into that tab's
+    terminal message right away - otherwise it would only become visible the
+    next time the user sent a real command. Waits for the shell's own prompt
+    marker to reappear (same signal run_shell_input() uses), capped at 5s as
+    a safety net for keystrokes that don't bring the prompt back on their own
+    (e.g. Enter inside a pager just redraws a page, it doesn't return to
+    bash). Returns True if it sent successfully."""
     channel = session.get("channel")
     if channel is None or channel.closed:
-        await query.answer("Nothing to cancel right now.")
-        return
+        return False
     try:
-        channel.send(engine.CTRL_C)
+        channel.send(data)
     except Exception:
-        await query.answer("⚠️ Could not cancel - the session may have dropped.")
-        return
-    await query.answer("🛑 Ctrl-C sent.")
+        return False
 
-    # query.answer() only pops a small toast - it never touches the terminal
-    # message, so without the block below the ^C and the fresh shell prompt
-    # only became visible the next time the user sent a command (this was the
-    # actual bug: the terminal looked unchanged right after tapping Cancel).
-    # Give the pty a brief moment to echo the ^C and print its next prompt,
-    # then fold that into the same terminal message right away.
     term_state = session.get("term_state")
     if term_state is None or term_state.get("msg") is None:
-        return
+        return True
 
     extra_output = ""
     start = time.monotonic()
-    last_data_at = start
     while True:
         got_data = False
         try:
@@ -2459,26 +2540,24 @@ async def servermgr_cmd_cancel_button(update: Update, context: ContextTypes.DEFA
                 if chunk:
                     extra_output += chunk
                     got_data = True
-                    last_data_at = time.monotonic()
             if channel.recv_stderr_ready():
                 chunk = channel.recv_stderr(4096).decode(errors="ignore")
                 if chunk:
                     extra_output += chunk
                     got_data = True
-                    last_data_at = time.monotonic()
         except Exception:
             break
-        now = time.monotonic()
-        if now - last_data_at > engine.SHELL_QUIET_SECONDS or now - start > 5:
+        if engine._SHELL_PROMPT_MARKER in extra_output or time.monotonic() - start > 5:
             break
         if not got_data:
             await asyncio.sleep(0.15)
 
+    extra_output = extra_output.replace(engine._SHELL_PROMPT_MARKER, "")
     if not extra_output:
-        return
+        return True
 
     term_state["output"] += extra_output
-    term_state["status"] = "🛑 Ctrl-C sent — send the next command."
+    term_state["status"] = status_text
     new_text = _format_terminal(
         term_state["label"], term_state["command"], term_state["output"],
         term_state["status"],
@@ -2492,9 +2571,75 @@ async def servermgr_cmd_cancel_button(update: Update, context: ContextTypes.DEFA
         )
     except BadRequest as e:
         if "not modified" not in str(e).lower():
-            logger.debug(f"terminal cancel edit failed: {e}")
+            logger.debug(f"terminal idle-keystroke edit failed: {e}")
     except Exception as e:
-        logger.debug(f"terminal cancel edit failed: {e}")
+        logger.debug(f"terminal idle-keystroke edit failed: {e}")
+    return True
+
+
+async def servermgr_cmd_cancel_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    session_id = query.data.replace(f"{CMD_CANCEL_CALLBACK}_", "", 1)
+    sessions = context.user_data.get("servermgr_sessions", {})
+    session = sessions.get(session_id)
+    if session is None:
+        await query.answer("That tab is no longer open.")
+        return
+
+    handle_box = session.get("cmd_handle_box")
+    handle = handle_box.get("handle") if handle_box else None
+    if handle is not None:
+        # A command is actively streaming in this tab - cancel it the normal way.
+        # run_shell_input()'s own loop already picks up whatever Ctrl-C produces.
+        session["cancel_requested"] = True
+        handle.cancel()
+        await query.answer("🛑 Cancelling…")
+        return
+
+    # No command is currently running in this tab (the button is shown at all
+    # times - see _stream_command()'s final edit above), but the shell session
+    # is still open, so send Ctrl-C straight to it - e.g. to break out of a
+    # stuck foreground program or an interactive menu the user no longer wants.
+    await query.answer("🛑 Ctrl-C sent.")
+    ok = await _inject_idle_keystroke(
+        context, session, session_id, engine.CTRL_C, "🛑 Ctrl-C sent — send the next command."
+    )
+    if not ok:
+        await query.answer("⚠️ Could not cancel - the session may have dropped.")
+
+
+async def servermgr_cmd_enter_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sends a bare Enter keystroke into a tab's shell - for programs that are
+    paused waiting on one with no other input needed: a pager (`less`, `git
+    log`), a "press any key to continue", a confirmation whose default answer
+    is just hitting Enter. Telegram has no way to send an empty text message,
+    so this button is the only way to produce that keystroke on its own."""
+    query = update.callback_query
+    session_id = query.data.replace(f"{CMD_ENTER_CALLBACK}_", "", 1)
+    sessions = context.user_data.get("servermgr_sessions", {})
+    session = sessions.get(session_id)
+    if session is None:
+        await query.answer("That tab is no longer open.")
+        return
+
+    handle_box = session.get("cmd_handle_box")
+    handle = handle_box.get("handle") if handle_box else None
+    if handle is not None:
+        # A command is actively streaming - just inject the keystroke, the
+        # already-running run_shell_input() loop streams back whatever it
+        # produces on its own, same as any other output.
+        if handle.send_raw("\n"):
+            await query.answer("⏎ Enter sent.")
+        else:
+            await query.answer("⚠️ Could not send Enter - the session may have dropped.")
+        return
+
+    await query.answer("⏎ Enter sent.")
+    ok = await _inject_idle_keystroke(
+        context, session, session_id, "\n", "⏎ Enter sent — send the next command."
+    )
+    if not ok:
+        await query.answer("⚠️ Could not send Enter - the session may have dropped.")
 
 
 # ========== Handler registration (call this function from main.py) ==========

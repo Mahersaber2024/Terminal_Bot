@@ -1,17 +1,4 @@
 # ====================== Automation: schedules, quick commands, server tags ======================
-# Adds three of the "missing features" flagged in the project review:
-#   - Cron-like scheduling ("run this command on this server every day at HH:MM")
-#   - Quick Commands / Favorites (save a command once, run it again with one tap) + history
-#   - Server tags (e.g. prod/staging)
-#
-# Kept as its own module (like ServerManager/health.py and ServerManager/maintenance.py)
-# rather than spread across handlers.py/admin.py, so storage, execution, AND the Telegram
-# UI for all three features live in one place. Integration with the rest of the bot is
-# intentionally tiny:
-#   - main.py registers this module's handlers and calls register_all_jobs() once at
-#     startup (same pattern as ServerManager/health.py's health-monitor job).
-#   - handlers.py's server detail screen gets ONE new button ("⚙️ Automation") that
-#     opens this module's own menu - everything past that button lives here.
 
 import asyncio
 import datetime
@@ -26,6 +13,7 @@ from telegram.ext import ContextTypes, ConversationHandler
 
 from . import engine
 from . import settings
+import subscription
 
 logger = logging.getLogger(__name__)
 
@@ -557,20 +545,28 @@ def _sched_list_keyboard(user_id, server_id):
             InlineKeyboardButton(f"⏰ {j['hour']:02d}:{j['minute']:02d} — {onoff}", callback_data=f"svauto_sched_toggle_{j['id']}"),
             InlineKeyboardButton("🗑", callback_data=f"svauto_sched_del_{j['id']}"),
         ])
-    keyboard.append([InlineKeyboardButton("➕ Add Schedule", callback_data=f"svauto_sched_add_{server_id}")])
+    max_automations = subscription.get_capabilities(user_id).get("max_automations")
+    at_cap = max_automations is not None and len(get_scheduled_jobs(user_id)) >= max_automations
+    add_label = "🔒 Add Schedule (plan limit reached)" if at_cap else "➕ Add Schedule"
+    keyboard.append([InlineKeyboardButton(add_label, callback_data=f"svauto_sched_add_{server_id}")])
     keyboard.append([InlineKeyboardButton("🔙 Back", callback_data=f"svauto_menu_{server_id}")])
     return InlineKeyboardMarkup(keyboard)
 
 
-def _sched_text(server, jobs) -> str:
+def _sched_text(server, jobs, user_id) -> str:
     lines = []
     for j in jobs:
         last = f" (last: {'✅' if j['last_ok'] else '❌'} {j['last_run'][:16].replace('T', ' ')})" if j.get("last_run") else ""
         lines.append(f"• `{j['hour']:02d}:{j['minute']:02d}` — `{j['command']}`{last}")
+    max_automations = subscription.get_capabilities(user_id).get("max_automations")
+    usage = (
+        f"{len(get_scheduled_jobs(user_id))}/{max_automations} automation jobs used (plan limit)"
+        if max_automations is not None else "Automation jobs: unlimited on your plan"
+    )
     return (
         f"⏰ *Scheduled Jobs — {server['label']}*\n\n"
         + ("\n".join(lines) if lines else "No scheduled jobs yet.")
-        + "\n\n_Times are the bot server's clock (usually UTC). Tap a job to toggle it on/off._"
+        + f"\n\n_{usage}. Times are the bot server's clock (usually UTC). Tap a job to toggle it on/off._"
     )
 
 
@@ -584,7 +580,7 @@ async def sched_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Server not found.")
         return
     jobs = get_scheduled_jobs(user_id, server_id)
-    text = _sched_text(server, jobs)
+    text = _sched_text(server, jobs, user_id)
     try:
         await query.edit_message_text(text, reply_markup=_sched_list_keyboard(user_id, server_id), parse_mode="Markdown")
     except BadRequest:
@@ -594,11 +590,22 @@ async def sched_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def sched_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    user_id = _uid(update)
     server_id = query.data.replace("svauto_sched_add_", "", 1)
-    server = settings.get_server(_uid(update), server_id)
+    server = settings.get_server(user_id, server_id)
     if not server:
         await query.edit_message_text("❌ Server not found.")
         return ConversationHandler.END
+
+    max_automations = subscription.get_capabilities(user_id).get("max_automations")
+    if max_automations is not None and len(get_scheduled_jobs(user_id)) >= max_automations:
+        await query.answer(
+            f"🔒 Your plan allows {max_automations} automation job(s) max. "
+            "Remove one first, or upgrade from 💳 Subscription.",
+            show_alert=True,
+        )
+        return ConversationHandler.END
+
     context.user_data["svauto_tmp"] = {"server_id": server_id}
     await _edit_then_prompt_cancel(query, f"💻 Send the command to run daily on *{server['label']}*.")
     return AUTO_SCHED_ADD_COMMAND
@@ -661,7 +668,7 @@ async def sched_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     jobs = get_scheduled_jobs(user_id, job["server_id"])
     try:
         await query.edit_message_text(
-            _sched_text(server, jobs), reply_markup=_sched_list_keyboard(user_id, job["server_id"]), parse_mode="Markdown",
+            _sched_text(server, jobs, user_id), reply_markup=_sched_list_keyboard(user_id, job["server_id"]), parse_mode="Markdown",
         )
     except BadRequest:
         pass
@@ -686,9 +693,9 @@ async def sched_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     jobs = get_scheduled_jobs(user_id, server_id)
     try:
-        await query.edit_message_text(_sched_text(server, jobs), reply_markup=_sched_list_keyboard(user_id, server_id), parse_mode="Markdown")
+        await query.edit_message_text(_sched_text(server, jobs, user_id), reply_markup=_sched_list_keyboard(user_id, server_id), parse_mode="Markdown")
     except BadRequest:
-        await query.edit_message_text(_sched_text(server, jobs), reply_markup=_sched_list_keyboard(user_id, server_id), parse_mode=None)
+        await query.edit_message_text(_sched_text(server, jobs, user_id), reply_markup=_sched_list_keyboard(user_id, server_id), parse_mode=None)
 
 
 # ---------------------- History (read-only) ----------------------

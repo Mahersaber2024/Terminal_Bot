@@ -24,6 +24,7 @@ from db.database import get_db
 from ServerManager import handlers as svm
 from ServerManager import health as svm_health
 from ServerManager import automation as svm_auto
+import proxy_utils
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -69,6 +70,13 @@ async def start(update: Update, context):
             )
         except Exception as e:
             logger.error(f"Could not register user {user.id} in the database: {e}")
+        try:
+            # New (or currently plan-less) users automatically get whichever
+            # plan is marked as default - see admin.py's "⭐ Set as default"
+            # button in Manage Plans. No-op for anyone with an active plan.
+            subscription.ensure_default_plan(user.id)
+        except Exception as e:
+            logger.error(f"Could not grant default plan to user {user.id}: {e}")
 
     text = (
         "👋 Welcome to *Terminal Bot*!\n\n"
@@ -111,6 +119,39 @@ async def set_bot_commands(application):
 
 async def error_handler(update: object, context):
     logger.error("Unhandled exception while processing an update", exc_info=context.error)
+
+
+# ====================== Proxy watchdog ======================
+# Only meaningful when more than one candidate is configured (TELEGRAM_PROXY_URLS).
+# PTB itself already retries forever on transient network errors, but it keeps
+# retrying through the SAME (possibly now-dead) proxy. This watchdog does a
+# lightweight getMe() every couple of minutes; after several consecutive
+# failures it deliberately exits the process. Your process manager
+# (systemd/pm2/Docker restart policy) then restarts the bot, which re-tests
+# every candidate from scratch and picks whichever one currently works -
+# effectively "try the next proxy" across a restart.
+PROXY_WATCHDOG_INTERVAL = 120  # seconds
+PROXY_WATCHDOG_FAIL_THRESHOLD = 3
+_proxy_watchdog_failures = 0
+
+
+async def proxy_watchdog_tick(context):
+    global _proxy_watchdog_failures
+    try:
+        await context.bot.get_me()
+        _proxy_watchdog_failures = 0
+    except Exception as e:
+        _proxy_watchdog_failures += 1
+        logger.warning(
+            f"🌐 Proxy connectivity check failed "
+            f"({_proxy_watchdog_failures}/{PROXY_WATCHDOG_FAIL_THRESHOLD}): {e}"
+        )
+        if _proxy_watchdog_failures >= PROXY_WATCHDOG_FAIL_THRESHOLD:
+            logger.error(
+                "🌐 Proxy looks dead after repeated checks - exiting so the process "
+                "manager restarts the bot and re-picks a working proxy."
+            )
+            os._exit(1)
 
 
 def main():
@@ -165,7 +206,23 @@ def main():
         # the "❌ Cancel" button is a separate update from the one currently being
         # processed (the streaming command), so without this the button tap just
         # queues up and isn't handled until the command finishes on its own.
-        application = Application.builder().token(config.BOT_TOKEN).concurrent_updates(True).build()
+        #
+        # Optional proxy support: the bot first tries connecting to Telegram
+        # DIRECTLY, retrying a few times (DIRECT_CONNECT_ATTEMPTS). Only if that
+        # keeps failing does it fall back to TELEGRAM_PROXY_URLS - a comma-separated
+        # list of candidates (e.g. "http://user:pass@host1:8080,socks5://host2:1080")
+        # - testing each and using the fastest one that works for both the
+        # getUpdates long-polling connection and regular bot-API calls.
+        # TELEGRAM_PROXY_URL (single value) still works too. See proxy_utils.py.
+        proxy_url = proxy_utils.resolve_proxy()
+        builder = Application.builder().token(config.BOT_TOKEN).concurrent_updates(True)
+        if proxy_url:
+            builder = builder.proxy(proxy_url).get_updates_proxy(proxy_url)
+        application = builder.build()
+        if proxy_url:
+            # Don't print credentials to logs/console.
+            safe = proxy_url.split("@")[-1] if "@" in proxy_url else proxy_url
+            print(f"🌐 Using proxy for Telegram connectivity: {safe}")
         print("✅ Bot initialized successfully!")
     except Exception as e:
         print(f"\n❌ Failed to initialize bot: {e}")
@@ -259,6 +316,19 @@ def main():
     application.add_handler(CallbackQueryHandler(admin.admin_plans_menu, pattern="^admin_plans_menu$"))
     application.add_handler(CallbackQueryHandler(admin.admin_plan_toggle, pattern=r"^admin_plan_toggle_"))
     application.add_handler(CallbackQueryHandler(admin.admin_plan_delete, pattern=r"^admin_plan_delete_"))
+    application.add_handler(CallbackQueryHandler(admin.admin_plan_edit_menu, pattern=r"^admin_plan_edit_"))
+
+    admin_plan_edit_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin.admin_plan_edit_field_start, pattern=r"^admin_plan_ef_")],
+        states={
+            admin.ADMIN_PLAN_EDIT_VALUE: [
+                admin_cancel_button,
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin.admin_plan_edit_value_input),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", admin.admin_cancel), admin_cancel_button],
+    )
+    application.add_handler(admin_plan_edit_conv)
 
     admin_plan_add_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin.admin_plan_add_start, pattern="^admin_plan_add$")],
@@ -282,6 +352,17 @@ def main():
             admin.ADMIN_PLAN_ADD_MAXTABS: [
                 admin_cancel_button,
                 MessageHandler(filters.TEXT & ~filters.COMMAND, admin.admin_plan_add_maxtabs_input),
+            ],
+            admin.ADMIN_PLAN_ADD_SFTP: [
+                CallbackQueryHandler(admin.admin_plan_add_sftp_choice, pattern="^admin_plan_add_sftp_(yes|no)$"),
+            ],
+            admin.ADMIN_PLAN_ADD_TIMEOUT: [
+                admin_cancel_button,
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin.admin_plan_add_timeout_input),
+            ],
+            admin.ADMIN_PLAN_ADD_MAXAUTO: [
+                admin_cancel_button,
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin.admin_plan_add_maxauto_input),
             ],
             admin.ADMIN_PLAN_ADD_DESC: [
                 admin_cancel_button,
@@ -490,6 +571,7 @@ def main():
                 CallbackQueryHandler(svm.servermgr_tabsbar_close, pattern=f"^{svm.TAB_CLOSE_CB_PREFIX}"),
                 CallbackQueryHandler(svm.servermgr_tabsbar_newtab, pattern=f"^{svm.TAB_NEWTAB_CB}$"),
                 CallbackQueryHandler(svm.servermgr_cmd_cancel_button, pattern=f"^{svm.CMD_CANCEL_CALLBACK}_"),
+                CallbackQueryHandler(svm.servermgr_cmd_enter_button, pattern=f"^{svm.CMD_ENTER_CALLBACK}_"),
                 servermgr_cancel_button,
                 MessageHandler(filters.TEXT & ~filters.COMMAND, svm.servermgr_cmd_input),
             ],
@@ -622,6 +704,20 @@ def main():
             f"or tune these from /admin → 🩺 Monitoring Settings."
         )
         svm_auto.register_all_jobs(application.job_queue)
+
+        proxy_candidates = proxy_utils.get_proxy_candidates()
+        if proxy_candidates:
+            application.job_queue.run_repeating(
+                proxy_watchdog_tick,
+                interval=PROXY_WATCHDOG_INTERVAL,
+                first=PROXY_WATCHDOG_INTERVAL,
+                name="proxy_watchdog",
+            )
+            print(
+                f"🌐 Proxy watchdog active - {len(proxy_candidates)} candidate(s) configured, "
+                f"checking every {PROXY_WATCHDOG_INTERVAL}s, restarts after "
+                f"{PROXY_WATCHDOG_FAIL_THRESHOLD} consecutive failures."
+            )
     else:
         print(
             "⚠️ JobQueue is unavailable - health monitoring disabled. Install the extra:\n"

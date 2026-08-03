@@ -8,6 +8,7 @@ import threading
 import time
 import logging
 import subprocess
+import uuid
 from typing import Callable, Dict, Optional, Tuple
 
 try:
@@ -21,8 +22,11 @@ SSH_CONNECT_TIMEOUT = 10  # seconds
 DEFAULT_CMD_TIMEOUT = int(os.getenv("SERVERMGR_CMD_TIMEOUT", "30"))  # seconds per command
 MAX_OUTPUT_CHARS = 3500  # keep replies under Telegram's message size limit
 STREAM_POLL_INTERVAL = 0.15  # seconds between recv_ready()/cancel checks while a command is running
-SHELL_QUIET_SECONDS = float(os.getenv("SERVERMGR_SHELL_QUIET_SECONDS", "1.5"))  # no new output for this long -> hand control back to the user, like a real terminal sitting at a prompt (or mid-way through an interactive program)
 CTRL_C = "\x03"
+
+_SHELL_PROMPT_MARKER = f"@@SM_READY_{uuid.uuid4().hex[:10]}@@"
+_SHELL_PROMPT_SETUP_CMD = f"unset PROMPT_COMMAND 2>/dev/null; PS1='{_SHELL_PROMPT_MARKER}'\n"
+_PROMPT_PRIME_TIMEOUT = 10  # seconds to wait for the very first prompt right after opening the shell
 
 
 class ServerManagerError(Exception):
@@ -35,19 +39,6 @@ class HostKeyChangedError(ServerManagerError):
     is a man-in-the-middle attempt. Either way, we refuse to connect silently."""
     pass
 
-
-# ==================================================
-# Host key pinning (Trust On First Use)
-#
-# We never call client.load_system_host_keys(), so paramiko treats every
-# host key as "not already known" and always asks our MissingHostKeyPolicy
-# what to do (despite the "missing" name, this callback fires on every
-# connection, not just the first one - which is exactly the hook we need to
-# implement pinning ourselves). On the very first connection to a host:port
-# we record its key fingerprint; on every connection after that we compare
-# against what's on file and refuse if it doesn't match, instead of the old
-# behaviour of silently trusting whatever key the server presents.
-# ==================================================
 KNOWN_HOSTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "known_hosts.json")
 _known_hosts_lock = threading.Lock()
 _known_hosts_cache = None
@@ -127,13 +118,7 @@ class _PinningHostKeyPolicy:
                 f"but it's also exactly what a man-in-the-middle attack looks like. Only proceed "
                 f"if you're sure the change is expected."
             )
-        # Matches what we have on file - proceed silently, same as a normal
-        # known_hosts hit.
 
-
-# ==================================================
-# Private key loading (SSH key auth)
-# ==================================================
 def _load_private_key(key_text: str, passphrase: Optional[str] = None) -> "paramiko.PKey":
     if paramiko is None:
         raise ServerManagerError("paramiko is not installed. Run: pip install paramiko")
@@ -370,7 +355,32 @@ def run_command_stream(
 def open_shell(client: "paramiko.SSHClient", term: str = "xterm", width: int = 120, height: int = 32) -> "paramiko.Channel":
     channel = client.invoke_shell(term=term, width=width, height=height)
     channel.settimeout(0.0)
+    _prime_shell_prompt(channel)
     return channel
+
+
+def _prime_shell_prompt(channel: "paramiko.Channel", timeout: float = _PROMPT_PRIME_TIMEOUT):
+    """Sets the unique PS1 marker on a freshly-opened shell and waits for it to
+    print once, swallowing whatever login banner/MOTD comes before it. Best
+    effort only: on the rare shell that won't accept a PS1 assignment (or is
+    too slow), we just give up silently and run_shell_input() falls back to
+    relying on its hard `timeout` instead of ever recognizing "done"."""
+    try:
+        channel.send(_SHELL_PROMPT_SETUP_CMD)
+    except Exception:
+        return
+    buf = ""
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
+        if channel.recv_ready():
+            try:
+                buf += channel.recv(4096).decode(errors="ignore")
+            except Exception:
+                return
+            if _SHELL_PROMPT_MARKER in buf:
+                return
+        else:
+            time.sleep(STREAM_POLL_INTERVAL)
 
 
 def close_shell(channel: Optional["paramiko.Channel"]):
@@ -383,20 +393,30 @@ def close_shell(channel: Optional["paramiko.Channel"]):
 
 
 class ShellHandle:
-    """Lets a Cancel button interrupt whatever is running in the shell (Ctrl-C)
-    without closing the channel - unlike CommandHandle.cancel(), closing here
-    would end the whole persistent session, not just the current command."""
+    """Lets a live button (Cancel, Enter, ...) inject keystrokes into whatever
+    is running in the shell right now, without closing the channel - unlike
+    CommandHandle.cancel(), closing here would end the whole persistent
+    session, not just the current command."""
 
     def __init__(self, channel: "paramiko.Channel"):
         self._channel = channel
         self._interrupt_requested = False
 
+    def send_raw(self, data: str) -> bool:
+        """Injects raw bytes into the channel mid-stream - e.g. a bare Enter
+        for a program that's paused waiting on one (a pager, a "press any
+        key" prompt, a confirmation with an empty default). The already-
+        running run_shell_input() loop picks up whatever this produces on
+        its own, same as any other output."""
+        try:
+            self._channel.send(data)
+            return True
+        except Exception:
+            return False
+
     def cancel(self):
         self._interrupt_requested = True
-        try:
-            self._channel.send(CTRL_C)
-        except Exception:
-            pass
+        self.send_raw(CTRL_C)
 
     @property
     def cancelled(self) -> bool:
@@ -407,14 +427,15 @@ def run_shell_input(
     channel: "paramiko.Channel",
     text: str,
     timeout: int = DEFAULT_CMD_TIMEOUT,
-    quiet_seconds: float = SHELL_QUIET_SECONDS,
     chunk_cb: Optional[Callable[["ShellHandle", str], None]] = None,
 ) -> Dict:
     """Send one line of input into an already-open shell (see open_shell()) and
     stream back whatever the pty prints, the same way a real terminal client
     would. There's no single "exit status" for a persistent shell, so instead
-    output is streamed until it goes quiet for `quiet_seconds` (the shell/program
-    is now idle and waiting on the user again) or `timeout` is hit."""
+    output is streamed until the shell's own prompt marker (see
+    _prime_shell_prompt()) reappears - meaning bash has genuinely finished and
+    is reading input again, not just paused for a moment or waiting silently
+    on some other program's prompt - or until the hard `timeout` is hit."""
     result = {"input": text, "output": "", "error": None, "cancelled": False, "timed_out": False}
 
     handle = ShellHandle(channel)
@@ -431,8 +452,8 @@ def run_shell_input(
         return result
 
     parts = []
+    tail = ""  # last chunk decoded so far, used to check for the marker without re-scanning the whole buffer each time
     start = time.monotonic()
-    last_data_at = start
     try:
         while True:
             got_data = False
@@ -440,33 +461,34 @@ def run_shell_input(
                 chunk = channel.recv(4096).decode(errors="ignore")
                 if chunk:
                     parts.append(chunk)
+                    tail = (tail + chunk)[-len(_SHELL_PROMPT_MARKER) * 2:]
                     got_data = True
-                    last_data_at = time.monotonic()
                     if chunk_cb:
                         chunk_cb(handle, chunk)
             if channel.recv_stderr_ready():
                 chunk = channel.recv_stderr(4096).decode(errors="ignore")
                 if chunk:
                     parts.append(chunk)
+                    tail = (tail + chunk)[-len(_SHELL_PROMPT_MARKER) * 2:]
                     got_data = True
-                    last_data_at = time.monotonic()
                     if chunk_cb:
                         chunk_cb(handle, chunk)
 
+            if _SHELL_PROMPT_MARKER in tail:
+                break
             if channel.closed:
                 break
             now = time.monotonic()
             if now - start > timeout:
                 result["timed_out"] = True
                 break
-            if now - last_data_at > quiet_seconds:
-                break
             if not got_data:
                 time.sleep(STREAM_POLL_INTERVAL)
     except Exception as e:
         result["error"] = str(e)[:300]
 
-    result["output"] = "".join(parts)[-MAX_OUTPUT_CHARS:]
+    output = "".join(parts).replace(_SHELL_PROMPT_MARKER, "")
+    result["output"] = output[-MAX_OUTPUT_CHARS:]
     result["cancelled"] = handle.cancelled
     return result
 
@@ -559,15 +581,6 @@ def check_health(server: Dict, timeout: int = 10) -> Dict:
     result["ok"] = True
     return result
 
-
-# ==================================================
-# SFTP (browse / upload / download files) - runs over the same paramiko
-# SSHClient as everything else here, just a different channel type opened
-# via client.open_sftp(). Kept as its own connection per browsing session
-# (server_manager_handlers.py opens a dedicated client for this rather than
-# reusing an open terminal tab's client) so closing the file browser can
-# never accidentally tear down a live terminal session, and vice versa.
-# ==================================================
 SFTP_MAX_DOWNLOAD_BYTES = 45 * 1024 * 1024  # stay under Telegram bots' ~50MB send-document limit
 SFTP_MAX_UPLOAD_BYTES = 19 * 1024 * 1024    # stay under Telegram bots' ~20MB file-download limit
 
@@ -690,15 +703,6 @@ def sftp_write_text(sftp: "paramiko.SFTPClient", path: str, content: str):
     with sftp.open(path, "wb") as f:
         f.write(content.encode("utf-8"))
 
-
-# ==================================================
-# Download-by-URL (server pulls the file itself via wget/curl)
-#
-# Telegram bots can't receive files over ~20MB (see SFTP_MAX_UPLOAD_BYTES
-# above) - that's a hard limit of Telegram's own Bot API, not something this
-# code can raise. For anything bigger, the file never has to touch Telegram
-# at all: we just ask the server to fetch the URL itself over SSH.
-# ==================================================
 def remote_download_url(client: "paramiko.SSHClient", cwd: str, filename: str, url: str, timeout: int = 600) -> Dict:
     result = {"ok": False, "stdout": "", "stderr": "", "exit_status": None, "error": None}
     command = (
