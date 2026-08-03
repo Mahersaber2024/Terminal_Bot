@@ -19,6 +19,7 @@ REQUIRED_FILES=(
   "sponsor_gate.py"
   "bot_settings.py"
   "subscription.py"
+  "proxy_utils.py"
   "requirements.txt"
 )
 
@@ -272,6 +273,11 @@ setup_venv(){
   source venv/bin/activate
   pip install --upgrade pip -q
   pip install -r requirements.txt -q
+  # proxy_utils.py (direct-connect / multi-proxy fallback support) needs
+  # httpx directly. python-telegram-bot already depends on it, so this is
+  # normally a no-op, but pin it explicitly so a proxy_utils import never
+  # fails on a requirements.txt that hasn't been updated yet.
+  pip install "httpx>=0.24" -q
   deactivate
   ok "Python packages installed."
 }
@@ -313,6 +319,12 @@ collect_bot_config(){
   read -rp "Sponsor channel invite links, format 'id:https://t.me/...' (optional): " SPONSOR_CHANNEL_LINKS
 
   echo
+  echo "Proxy support: the bot always tries connecting to Telegram directly first"
+  echo "(3 attempts) - proxies are only used as a fallback if that keeps failing."
+  echo "Format: comma-separated, e.g. http://user:pass@host1:8080,socks5://host2:1080"
+  read -rp "Proxy URLs (optional, leave blank to skip): " TELEGRAM_PROXY_URLS
+
+  echo
   CRYPTO_SECRET=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
   info "Generated a random CRYPTO_SECRET to encrypt stored SSH passwords at rest."
   warn "This secret is written to ${INSTALL_DIR}/.env - back it up. If it's lost or changed, previously saved server passwords can no longer be decrypted."
@@ -337,6 +349,7 @@ DB_PORT=${DB_PORT}
 DB_NAME=${DB_NAME}
 DB_USER=${DB_USER}
 DB_PASSWORD=${DB_PASS}
+TELEGRAM_PROXY_URLS=${TELEGRAM_PROXY_URLS}
 EOF
   chmod 600 "${env_file}"
   ok ".env file created (restricted access)."
