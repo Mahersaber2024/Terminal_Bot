@@ -53,20 +53,11 @@ sudo bash full_backup.sh /opt/terminal-bot /opt/backups
 
 The first argument is the bot's install path and the second is the output path for the backup archive — change them if your bot is installed elsewhere. The final output is a `.tar.gz` file in `/opt/backups`, and its exact path is printed at the end of the script's run.
 
-If this folder doesn't exist on your server (older install, or deleted), you can download them directly from the repo:
-```bash
-curl -fsSL -o full_backup.sh https://raw.githubusercontent.com/Mahersaber2024/JadeTunnel-sales/main/backups/full_backup.sh
-curl -fsSL -o restore_backup.sh https://raw.githubusercontent.com/Mahersaber2024/JadeTunnel-sales/main/backups/restore_backup.sh
-chmod +x full_backup.sh restore_backup.sh
-sudo bash full_backup.sh /opt/terminal-bot /opt/backups
-```
-
-To restore on a new server (which doesn't yet have `backups/` from an install, so you need to download it):
+To restore on a new server, first run `install.sh` there as usual (this also puts `backups/` in place), then copy the backup archive over and run `restore_backup.sh` from that same path:
 ```bash
 scp /opt/backups/terminalbot_backup_*.tar.gz root@NEW_SERVER_IP:/root/
-# on the new server:
-curl -fsSL -o restore_backup.sh https://raw.githubusercontent.com/Mahersaber2024/JadeTunnel-sales/main/backups/restore_backup.sh
-chmod +x restore_backup.sh
+# on the new server, after install.sh has been run:
+cd /opt/terminal-bot/backups
 sudo bash restore_backup.sh /root/terminalbot_backup_*.tar.gz /opt/terminal-bot
 ```
 
