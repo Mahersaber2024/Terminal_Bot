@@ -30,9 +30,7 @@ async def _is_member(bot, channel_id, user_id) -> bool:
         member = await bot.get_chat_member(chat_id=channel_id, user_id=user_id)
         return member.status in _JOINED_STATUSES
     except TelegramError as e:
-        # Most common cause: the bot isn't an admin in the channel, or the
-        # user has never interacted with it. Fail closed (treat as "not
-        # joined") but log it so the misconfiguration is easy to spot.
+        # Fail closed (treat as "not joined") and log the misconfiguration.
         logger.warning(f"Sponsor check failed for channel {channel_id}: {e}")
         return False
 
@@ -46,15 +44,15 @@ async def _missing_channels(bot, user_id):
 
 
 def _prompt_keyboard(missing):
-    rows = [[InlineKeyboardButton(f"➕ {ch['title']}", url=_channel_link(ch))] for ch in missing]
-    rows.append([InlineKeyboardButton("✅ I've joined", callback_data=SPONSOR_CHECK_CALLBACK)])
+    rows = [[InlineKeyboardButton(f"+ {ch['title']}", url=_channel_link(ch))] for ch in missing]
+    rows.append([InlineKeyboardButton("✓ I've joined", callback_data=SPONSOR_CHECK_CALLBACK)])
     return InlineKeyboardMarkup(rows)
 
 
 def _prompt_text(missing):
-    lines = ["🔒 To use this bot, please join the following channel(s) first:", ""]
+    lines = ["⚿ To use this bot, please join the following channel(s) first:", ""]
     lines += [f"• {ch['title']}" for ch in missing]
-    lines += ["", "Then tap \"✅ I've joined\" below."]
+    lines += ["", "Then tap \"✓ I've joined\" below."]
     return "\n".join(lines)
 
 
@@ -69,10 +67,10 @@ async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if get_db().is_banned(user.id):
             if update.message:
-                await update.message.reply_text("⛔️ You have been banned from using this bot.")
+                await update.message.reply_text("⊘ You have been banned from using this bot.")
             elif update.callback_query:
                 try:
-                    await update.callback_query.answer("⛔️ You have been banned from using this bot.", show_alert=True)
+                    await update.callback_query.answer("⊘ You have been banned from using this bot.", show_alert=True)
                 except TelegramError:
                     pass
             raise ApplicationHandlerStop
@@ -119,15 +117,12 @@ async def sponsor_check_callback(update: Update, context: ContextTypes.DEFAULT_T
             pass
         return
 
-    await query.answer("✅ Thanks! Access granted.")
+    await query.answer("✓ Thanks! Access granted.")
     try:
-        await query.edit_message_text("✅ Membership confirmed - you're all set!")
+        await query.edit_message_text("✓ Membership confirmed - you're all set!")
     except TelegramError:
         pass
 
-    # Send a fresh /start so the user immediately sees the main menu instead
-    # of having to type /start themselves. Deferred import (rather than at
-    # module load time) to avoid a circular import with main.py, which
-    # imports sponsor_gate itself.
+    # Deferred import to avoid a circular import with main.py.
     import main
     await main.start(update, context)

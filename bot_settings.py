@@ -44,6 +44,33 @@ def _seed_defaults() -> dict:
         "health_check_timeout": int(os.getenv("SERVERMGR_HEALTH_TIMEOUT", "12")),
         "disk_alert_percent": int(os.getenv("SERVERMGR_DISK_ALERT_PERCENT", "90")),
         "disk_alert_hysteresis": 5,
+        "cpu_alert_percent": 90,
+        "ram_alert_percent": 90,
+        # Owner Server (the host the bot itself runs on) - see
+        # ServerManager/owner_server.py and admin.py's "🖥 Owner Server"
+        # menu. Admin-only; on by default so upgrading doesn't silently
+        # turn host monitoring off.
+        "owner_monitor_enabled": True,
+        # IANA timezone name (e.g. "Europe/Berlin") the Owner Server card's
+        # clock is rendered in - independent of whatever TZ the host OS
+        # itself is set to. See ServerManager/owner_server.server_time_info()
+        # and admin.py's "🕐 Set Timezone" button. Defaults to UTC so a
+        # fresh install always shows something valid.
+        "owner_timezone": os.getenv("OWNER_TIMEZONE", "UTC"),
+        # Admin-added buttons for the Owner Server Terminal's "⚡️ Quick"
+        # menu (see admin.py's OWNERSRV_QUICK_COMMANDS for the built-in
+        # ones this list is appended to). Each entry is {"label", "cmd"}.
+        # Managed entirely from the "➕ Add command" / "🗑 Remove" buttons
+        # in that menu - never touched by the .env file.
+        "owner_quick_commands": [],
+        # Telegram group id used as the activity log group (see
+        # logger_bot.py). Set via the /setloggroup command run inside the
+        # target group. None until an admin sets it.
+        "log_group_id": None,
+        # Display name appended to log-group topic titles (see
+        # logger_bot.py's _topic_display_name), e.g. "New Users(Terminal Bot)".
+        # Defaults to "Terminal Bot"; changeable via the "▤ Log Group" admin menu.
+        "bot_name": "Terminal Bot",
     }
 
 
@@ -70,6 +97,13 @@ def _load() -> dict:
     data.setdefault("health_check_timeout", int(os.getenv("SERVERMGR_HEALTH_TIMEOUT", "12")))
     data.setdefault("disk_alert_percent", int(os.getenv("SERVERMGR_DISK_ALERT_PERCENT", "90")))
     data.setdefault("disk_alert_hysteresis", 5)
+    data.setdefault("cpu_alert_percent", 90)
+    data.setdefault("ram_alert_percent", 90)
+    data.setdefault("owner_monitor_enabled", True)
+    data.setdefault("owner_timezone", os.getenv("OWNER_TIMEZONE", "UTC"))
+    data.setdefault("owner_quick_commands", [])
+    data.setdefault("log_group_id", None)
+    data.setdefault("bot_name", "Terminal Bot")
     _cache = data
     return data
 
@@ -201,4 +235,113 @@ def set_disk_alert_percent(value: int):
 def set_disk_alert_hysteresis(value: int):
     data = _load()
     data["disk_alert_hysteresis"] = int(value)
+    _save(data)
+
+
+def get_cpu_alert_percent() -> int:
+    return int(_load().get("cpu_alert_percent", 90))
+
+
+def get_ram_alert_percent() -> int:
+    return int(_load().get("ram_alert_percent", 90))
+
+
+def set_cpu_alert_percent(value: int):
+    data = _load()
+    data["cpu_alert_percent"] = int(value)
+    _save(data)
+
+
+def set_ram_alert_percent(value: int):
+    data = _load()
+    data["ram_alert_percent"] = int(value)
+    _save(data)
+
+
+# ====================== Owner Server (host) monitoring toggle ======================
+# Whether the background health-monitor job (ServerManager/health.py) also
+# sweeps the local host, in addition to every registered remote server.
+# Alerts go to every id in config.ADMIN_IDS, never to regular users - see
+# health.py's owner-server tick and admin.py's "🖥 Owner Server" menu.
+
+def is_owner_monitor_enabled() -> bool:
+    return bool(_load().get("owner_monitor_enabled", True))
+
+
+def set_owner_monitor_enabled(value: bool):
+    data = _load()
+    data["owner_monitor_enabled"] = bool(value)
+    _save(data)
+
+
+# ====================== Owner Server (host) clock timezone ======================
+# Purely a display setting for the Owner Server card's date/time line - it
+# does not touch the host's actual system timezone. Validated against the
+# IANA tz database by the caller (admin.py) before being saved here;
+# server_time_info() falls back to UTC on its own if an invalid name ever
+# ends up on disk.
+
+def get_owner_timezone() -> str:
+    return _load().get("owner_timezone", "UTC")
+
+
+def set_owner_timezone(value: str):
+    data = _load()
+    data["owner_timezone"] = (value or "UTC").strip()
+    _save(data)
+
+
+# ====================== Owner Server Terminal - custom quick commands ======================
+# Admin-added buttons appended to admin.py's built-in OWNERSRV_QUICK_COMMANDS
+# in the "⚡️ Quick" menu (see admin.py's _ownersrv_all_quick_commands()).
+# Each entry is {"label": <button text>, "cmd": <shell command>}.
+
+def get_owner_quick_commands() -> list:
+    return list(_load().get("owner_quick_commands", []))
+
+
+def add_owner_quick_command(label: str, cmd: str) -> dict:
+    entry = {"label": (label or cmd).strip(), "cmd": (cmd or "").strip()}
+    data = _load()
+    data.setdefault("owner_quick_commands", []).append(entry)
+    _save(data)
+    return entry
+
+
+def remove_owner_quick_command(index: int) -> bool:
+    data = _load()
+    commands = data.setdefault("owner_quick_commands", [])
+    if 0 <= index < len(commands):
+        commands.pop(index)
+        _save(data)
+        return True
+    return False
+
+
+# ====================== Log group (logger_bot.py) ======================
+# Telegram group used for activity logs. Set via the /setloggroup command
+# run inside the target group (see admin.py's admin_set_log_group).
+
+def get_log_group_id():
+    return _load().get("log_group_id")
+
+
+def set_log_group_id(group_id: int):
+    data = _load()
+    data["log_group_id"] = int(group_id)
+    _save(data)
+
+
+# ====================== Bot display name (logger_bot.py topics) ======================
+# Suffix appended to log-group topic titles, e.g. "New Users(Terminal Bot)".
+# Set via the "▤ Log Group" admin menu's "✎ Set Bot Name" button
+# (see admin.py's admin_botname_set_start/_input).
+
+def get_bot_name() -> str:
+    return _load().get("bot_name", "Terminal Bot")
+
+
+def set_bot_name(value: str):
+    data = _load()
+    data["bot_name"] = (value or "").strip()
     _save(data)

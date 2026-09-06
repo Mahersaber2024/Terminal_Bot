@@ -8,8 +8,7 @@ from crypto_utils import encrypt_value, decrypt_value
 logger = logging.getLogger(__name__)
 
 
-# Every one of these fields is sensitive (SSH password, private key material,
-# and the passphrase protecting it) and gets encrypted at rest via crypto_utils.
+# Encrypted at rest via crypto_utils
 _SENSITIVE_FIELDS = ("password", "private_key", "key_passphrase")
 
 
@@ -35,9 +34,7 @@ def _decrypt_servers_in_memory(servers: list) -> list:
     return out
 
 
-# این فایل داخل پوشه‌ی ServerManager قرار دارد؛ فایل تنظیمات هم همین‌جا ساخته می‌شود.
-# این ماژول برای همه‌ی کاربران رباته - هر کاربر فقط سرورهای خودش را می‌بیند،
-# بنابراین همه چیز زیر کلید user_id ذخیره می‌شود (نه یک لیست مشترک).
+# Shared by all bot users - servers stored under the user_id key
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server_manager_settings.json")
 
 DEFAULT_SETTINGS = {
@@ -107,9 +104,7 @@ def add_server(
     private_key: str = "",
     key_passphrase: str = "",
 ) -> dict:
-    """Registers a server, authenticated with either a password OR an SSH
-    private key (pass whichever one applies; leave the other at its default).
-    private_key takes priority if both happen to be set."""
+    """Registers a server, authenticated with either a password or an SSH key."""
     data = _load()
     users = data.setdefault("users", {})
     key = _uid_key(user_id)
@@ -121,13 +116,11 @@ def add_server(
         "port": int(port) if port else 22,
         "username": (username or "root").strip(),
         "auth_type": "key" if private_key else "password",
-        # نگه‌داری plaintext در حافظه (همان چیزی که به caller برمی‌گردد)،
-        # اما رمزنگاری‌شده با crypto_utils قبل از نوشتن روی دیسک - به _save() نگاه کنید.
+        # Encrypted on disk, see _save()
         "password": password or "",
         "private_key": private_key or "",
         "key_passphrase": key_passphrase or "",
-        # Health monitoring (see server_manager_health.py) - on by default,
-        # toggleable per-server from the "🔔 Alerts" button in server detail.
+        # On by default, toggleable per-server
         "monitor_enabled": True,
     }
     servers.append(server)
@@ -138,10 +131,7 @@ def add_server(
 
 
 def get_all_servers() -> list:
-    """Every server across every user, as (user_id_str, server) pairs -
-    used by the health-monitor background job, which sweeps every
-    registered server regardless of owner (each owner is still only ever
-    DMed about their own servers - see server_manager_health.py)."""
+    """Every server across every user, as (user_id_str, server) pairs."""
     data = _load()
     out = []
     for uid, servers in data.get("users", {}).items():
@@ -174,6 +164,20 @@ def remove_server(user_id, server_id: str) -> bool:
     if len(new_servers) == len(servers):
         return False
     users[key] = new_servers
+    data["users"] = users
+    _save(data)
+    return True
+
+
+def delete_user_data(user_id) -> bool:
+    """Wipes every server this user registered (used when an admin fully
+    deletes a user's account). Returns True if there was anything to remove."""
+    data = _load()
+    users = data.setdefault("users", {})
+    key = _uid_key(user_id)
+    if key not in users:
+        return False
+    del users[key]
     data["users"] = users
     _save(data)
     return True

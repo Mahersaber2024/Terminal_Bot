@@ -26,14 +26,11 @@ logger = logging.getLogger(__name__)
     AUTO_SCHED_ADD_TIME,
 ) = range(5)
 
-CANCEL_BUTTON_TEXT = "❌ Cancel"
+CANCEL_BUTTON_TEXT = "✕ Cancel"
 RUN_TIMEOUT = 60           # seconds - for scheduled runs, quick-command runs, and "Run Now"
 MAX_HISTORY = 15           # per user, most-recent-first
 JOB_NAME_PREFIX = "servermgr_sched_"
 
-# Wired up from main.py the same way admin.py and ServerManager/handlers.py get
-# their main-menu keyboard (see main.py: set_get_main_menu), so this module
-# doesn't need to import main.py.
 _get_main_menu_func = None
 
 
@@ -42,9 +39,9 @@ def set_get_main_menu(func):
     _get_main_menu_func = func
 
 
-def get_main_menu():
+def get_main_menu(user_id=None):
     if _get_main_menu_func:
-        return _get_main_menu_func()
+        return _get_main_menu_func(user_id)
     return ReplyKeyboardMarkup([[]], resize_keyboard=True)
 
 
@@ -58,14 +55,20 @@ async def _edit_then_prompt_cancel(query, text: str):
     except BadRequest as e:
         logger.warning(f"_edit_then_prompt_cancel: edit failed ({e}); sending a new message instead")
         await query.message.reply_text(text)
-    await query.message.reply_text("👇 Tap below to cancel:", reply_markup=_cancel_kb())
+    await query.message.reply_text("↓ Tap below to cancel:", reply_markup=_cancel_kb())
 
 
 async def automation_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fallback for /cancel or the "❌ Cancel" reply-keyboard button while an
+    """Fallback for /cancel or the "✕ Cancel" reply-keyboard button while an
     automation conversation (tag / quick command / schedule) is waiting on input."""
-    context.user_data.pop("svauto_tmp", None)
-    await update.message.reply_text("❌ Operation cancelled.", reply_markup=get_main_menu())
+    tmp = context.user_data.pop("svauto_tmp", None) or {}
+    user_id = _uid(update)
+    server = settings.get_server(user_id, tmp.get("server_id")) if tmp.get("server_id") else None
+    if not server:
+        await update.message.reply_text("✕ Operation cancelled.", reply_markup=get_main_menu(user_id))
+        return ConversationHandler.END
+    menu_text, menu_keyboard = _automation_menu_content(user_id, server)
+    await _finish_with_menu(update, "✕ Operation cancelled.", menu_text, menu_keyboard)
     return ConversationHandler.END
 
 
@@ -74,9 +77,6 @@ def _uid(update: Update):
 
 
 # ====================== Storage ======================
-# Own JSON file, same directory/pattern as settings.py's server_manager_settings.json.
-# Nothing stored here is sensitive (no passwords/keys), so - unlike settings.py - it's
-# plain JSON, no encryption needed.
 STORE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server_manager_automation.json")
 DEFAULT_STORE = {"users": {}}
 _cache = None
@@ -301,6 +301,25 @@ def register_all_jobs(job_queue) -> None:
         schedule_job(job_queue, user_id, job)
 
 
+def delete_user_data(job_queue, user_id) -> bool:
+    """Wipes every tag/quick-command/history/scheduled-job this user has
+    (used when an admin fully deletes a user's account). Cancels any of
+    their jobs still registered with the JobQueue first, then drops their
+    whole bucket from server_manager_automation.json. Returns True if
+    there was anything to remove."""
+    for job in get_scheduled_jobs(user_id):
+        unschedule_job(job_queue, user_id, job["id"])
+    data = _load()
+    users = data.setdefault("users", {})
+    key = _uid_key(user_id)
+    if key not in users:
+        return False
+    del users[key]
+    data["users"] = users
+    _save(data)
+    return True
+
+
 # ====================== Execution (shared by scheduled jobs, quick commands, "Run Now") ======================
 
 def _run_ssh_command_sync(server: dict, command: str, timeout: int = RUN_TIMEOUT) -> dict:
@@ -321,14 +340,14 @@ def _run_ssh_command_sync(server: dict, command: str, timeout: int = RUN_TIMEOUT
 
 def _format_run_result(label: str, command: str, result: dict) -> str:
     if result.get("error"):
-        return f"⚠️ *{label}*\n`{command}`\n\n❌ {result['error']}"
+        return f"⚠ *{label}*\n`{command}`\n\n✕ {result['error']}"
     out = (result.get("stdout") or "").strip()
     err = (result.get("stderr") or "").strip()
-    status = "✅" if result.get("ok") else f"❌ exit {result.get('exit_status')}"
+    status = "✓" if result.get("ok") else f"✕ exit {result.get('exit_status')}"
     body = out or err or "(no output)"
     if len(body) > 3200:
         body = "…(truncated)…\n" + body[-3200:]
-    return f"⚙️ *{label}*\n`{command}`\n\n{status}\n```\n{body}\n```"
+    return f"⚙ *{label}*\n`{command}`\n\n{status}\n```\n{body}\n```"
 
 
 async def _execute_and_report(bot, user_id, server: dict, label: str, command: str) -> bool:
@@ -359,6 +378,38 @@ async def _scheduled_job_tick(context: ContextTypes.DEFAULT_TYPE):
 
 # ====================== UI: Automation menu (entry point from server detail) ======================
 
+def _automation_menu_content(user_id, server):
+    server_id = server["id"]
+    tag = get_tag(user_id, server_id)
+    qcs = get_quick_commands(user_id, server_id)
+    jobs = get_scheduled_jobs(user_id, server_id)
+    enabled_jobs = [j for j in jobs if j["enabled"]]
+    text = (
+        f"⚙ *Automation — {server['label']}*\n\n"
+        f"# Tag: {tag or '_none_'}\n"
+        f"✦ Quick Commands: {len(qcs)} saved\n"
+        f"⏰ Scheduled Jobs: {len(jobs)} ({len(enabled_jobs)} active)"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("# Set Tag", callback_data=f"svauto_tag_start_{server_id}")],
+        [InlineKeyboardButton("✦ Quick Commands", callback_data=f"svauto_qc_{server_id}")],
+        [InlineKeyboardButton("⏰ Scheduled Jobs", callback_data=f"svauto_sched_{server_id}")],
+        [InlineKeyboardButton("▤ History", callback_data=f"svauto_hist_{server_id}")],
+        [InlineKeyboardButton("← Back", callback_data=f"servermgr_srv_{server_id}")],
+    ])
+    return text, keyboard
+
+
+async def _finish_with_menu(update: Update, confirm_text: str, menu_text: str, menu_keyboard: InlineKeyboardMarkup):
+    """Ends a plain-text conversation step and re-shows the origin menu."""
+    from telegram import ReplyKeyboardRemove
+    await update.message.reply_text(confirm_text, reply_markup=ReplyKeyboardRemove(), parse_mode="Markdown")
+    try:
+        await update.message.reply_text(menu_text, reply_markup=menu_keyboard, parse_mode="Markdown")
+    except BadRequest:
+        await update.message.reply_text(menu_text, reply_markup=menu_keyboard, parse_mode=None)
+
+
 async def automation_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -366,29 +417,13 @@ async def automation_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = _uid(update)
     server = settings.get_server(user_id, server_id)
     if not server:
-        await query.edit_message_text("❌ Server not found.")
+        await query.edit_message_text("✕ Server not found.")
         return
-    tag = get_tag(user_id, server_id)
-    qcs = get_quick_commands(user_id, server_id)
-    jobs = get_scheduled_jobs(user_id, server_id)
-    enabled_jobs = [j for j in jobs if j["enabled"]]
-    text = (
-        f"⚙️ *Automation — {server['label']}*\n\n"
-        f"🏷 Tag: {tag or '_none_'}\n"
-        f"⭐ Quick Commands: {len(qcs)} saved\n"
-        f"⏰ Scheduled Jobs: {len(jobs)} ({len(enabled_jobs)} active)"
-    )
-    keyboard = [
-        [InlineKeyboardButton("🏷 Set Tag", callback_data=f"svauto_tag_start_{server_id}")],
-        [InlineKeyboardButton("⭐ Quick Commands", callback_data=f"svauto_qc_{server_id}")],
-        [InlineKeyboardButton("⏰ Scheduled Jobs", callback_data=f"svauto_sched_{server_id}")],
-        [InlineKeyboardButton("📜 History", callback_data=f"svauto_hist_{server_id}")],
-        [InlineKeyboardButton("🔙 Back", callback_data=f"servermgr_srv_{server_id}")],
-    ]
+    text, keyboard = _automation_menu_content(user_id, server)
     try:
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
     except BadRequest:
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=None)
+        await query.edit_message_text(text, reply_markup=keyboard, parse_mode=None)
 
 
 # ---------------------- Tag flow ----------------------
@@ -399,13 +434,13 @@ async def tag_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     server_id = query.data.replace("svauto_tag_start_", "", 1)
     server = settings.get_server(_uid(update), server_id)
     if not server:
-        await query.edit_message_text("❌ Server not found.")
+        await query.edit_message_text("✕ Server not found.")
         return ConversationHandler.END
     context.user_data["svauto_tmp"] = {"server_id": server_id}
     current = get_tag(_uid(update), server_id)
     await _edit_then_prompt_cancel(
         query,
-        f"🏷 Send a tag for *{server['label']}* (e.g. prod, staging).\n"
+        f"# Send a tag for *{server['label']}* (e.g. prod, staging).\n"
         f"Current: {current or 'none'}. Send `-` to clear it.",
     )
     return AUTO_TAG_INPUT
@@ -415,14 +450,18 @@ async def tag_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tmp = context.user_data.get("svauto_tmp") or {}
     server_id = tmp.get("server_id")
     text = update.message.text.strip()
-    if not server_id:
-        await update.message.reply_text("❌ Something went wrong, please try again.", reply_markup=get_main_menu())
+    user_id = _uid(update)
+    server = settings.get_server(user_id, server_id) if server_id else None
+    if not server:
+        await update.message.reply_text("✕ Something went wrong, please try again.", reply_markup=get_main_menu(update.effective_user.id))
         return ConversationHandler.END
-    set_tag(_uid(update), server_id, "" if text == "-" else text)
+    set_tag(user_id, server_id, "" if text == "-" else text)
     context.user_data.pop("svauto_tmp", None)
-    await update.message.reply_text(
-        "✅ Tag cleared." if text == "-" else f"✅ Tag set to `{text}`.",
-        reply_markup=get_main_menu(), parse_mode="Markdown",
+    menu_text, menu_keyboard = _automation_menu_content(user_id, server)
+    await _finish_with_menu(
+        update,
+        "✓ Tag cleared." if text == "-" else f"✓ Tag set to `{text}`.",
+        menu_text, menu_keyboard,
     )
     return ConversationHandler.END
 
@@ -433,12 +472,21 @@ def _qc_list_keyboard(user_id, server_id):
     keyboard = []
     for q in get_quick_commands(user_id, server_id):
         keyboard.append([
-            InlineKeyboardButton(f"▶️ {q['label']}", callback_data=f"svauto_qc_run_{q['id']}"),
-            InlineKeyboardButton("🗑", callback_data=f"svauto_qc_del_{q['id']}"),
+            InlineKeyboardButton(f"▶ {q['label']}", callback_data=f"svauto_qc_run_{q['id']}"),
+            InlineKeyboardButton("⌫", callback_data=f"svauto_qc_del_{q['id']}"),
         ])
-    keyboard.append([InlineKeyboardButton("➕ Add", callback_data=f"svauto_qc_add_{server_id}")])
-    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data=f"svauto_menu_{server_id}")])
+    keyboard.append([InlineKeyboardButton("+ Add", callback_data=f"svauto_qc_add_{server_id}")])
+    keyboard.append([InlineKeyboardButton("← Back", callback_data=f"svauto_menu_{server_id}")])
     return InlineKeyboardMarkup(keyboard)
+
+
+def _qc_menu_content(user_id, server):
+    server_id = server["id"]
+    qcs = get_quick_commands(user_id, server_id)
+    text = f"✦ *Quick Commands — {server['label']}*\n\n" + (
+        "\n".join(f"• *{q['label']}* — `{q['command']}`" for q in qcs) if qcs else "No saved commands yet."
+    )
+    return text, _qc_list_keyboard(user_id, server_id)
 
 
 async def qc_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -448,16 +496,13 @@ async def qc_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = _uid(update)
     server = settings.get_server(user_id, server_id)
     if not server:
-        await query.edit_message_text("❌ Server not found.")
+        await query.edit_message_text("✕ Server not found.")
         return
-    qcs = get_quick_commands(user_id, server_id)
-    text = f"⭐ *Quick Commands — {server['label']}*\n\n" + (
-        "\n".join(f"• *{q['label']}* — `{q['command']}`" for q in qcs) if qcs else "No saved commands yet."
-    )
+    text, keyboard = _qc_menu_content(user_id, server)
     try:
-        await query.edit_message_text(text, reply_markup=_qc_list_keyboard(user_id, server_id), parse_mode="Markdown")
+        await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
     except BadRequest:
-        await query.edit_message_text(text, reply_markup=_qc_list_keyboard(user_id, server_id), parse_mode=None)
+        await query.edit_message_text(text, reply_markup=keyboard, parse_mode=None)
 
 
 async def qc_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -466,21 +511,21 @@ async def qc_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     server_id = query.data.replace("svauto_qc_add_", "", 1)
     server = settings.get_server(_uid(update), server_id)
     if not server:
-        await query.edit_message_text("❌ Server not found.")
+        await query.edit_message_text("✕ Server not found.")
         return ConversationHandler.END
     context.user_data["svauto_tmp"] = {"server_id": server_id}
-    await _edit_then_prompt_cancel(query, "⭐ Send a short label for this quick command (e.g. Restart nginx).")
+    await _edit_then_prompt_cancel(query, "✦ Send a short label for this quick command (e.g. Restart nginx).")
     return AUTO_QC_ADD_LABEL
 
 
 async def qc_add_label(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if not text:
-        await update.message.reply_text("❌ Please send a label, or tap Cancel.", reply_markup=_cancel_kb())
+        await update.message.reply_text("✕ Please send a label, or tap Cancel.", reply_markup=_cancel_kb())
         return AUTO_QC_ADD_LABEL
     context.user_data.setdefault("svauto_tmp", {})["label"] = text
     await update.message.reply_text(
-        "💻 Now send the actual command to run (e.g. systemctl restart nginx).", reply_markup=_cancel_kb(),
+        "▣ Now send the actual command to run (e.g. systemctl restart nginx).", reply_markup=_cancel_kb(),
     )
     return AUTO_QC_ADD_COMMAND
 
@@ -490,13 +535,19 @@ async def qc_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tmp = context.user_data.get("svauto_tmp") or {}
     server_id, label = tmp.get("server_id"), tmp.get("label")
     if not text or not server_id or not label:
-        await update.message.reply_text("❌ Please send a command, or tap Cancel.", reply_markup=_cancel_kb())
+        await update.message.reply_text("✕ Please send a command, or tap Cancel.", reply_markup=_cancel_kb())
         return AUTO_QC_ADD_COMMAND
-    add_quick_command(_uid(update), server_id, label, text)
+    user_id = _uid(update)
+    add_quick_command(user_id, server_id, label, text)
     context.user_data.pop("svauto_tmp", None)
-    await update.message.reply_text(
-        f"✅ Saved *{label}* as a quick command.", reply_markup=get_main_menu(), parse_mode="Markdown",
-    )
+    server = settings.get_server(user_id, server_id)
+    if not server:
+        await update.message.reply_text(
+            f"✓ Saved *{label}* as a quick command.", reply_markup=get_main_menu(update.effective_user.id), parse_mode="Markdown",
+        )
+        return ConversationHandler.END
+    menu_text, menu_keyboard = _qc_menu_content(user_id, server)
+    await _finish_with_menu(update, f"✓ Saved *{label}* as a quick command.", menu_text, menu_keyboard)
     return ConversationHandler.END
 
 
@@ -507,13 +558,13 @@ async def qc_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = _uid(update)
     qc = get_quick_command(user_id, qc_id)
     if not qc:
-        await query.edit_message_text("❌ Quick command not found.")
+        await query.edit_message_text("✕ Quick command not found.")
         return
     server = settings.get_server(user_id, qc["server_id"])
     if not server:
-        await query.edit_message_text("❌ Server not found.")
+        await query.edit_message_text("✕ Server not found.")
         return
-    await _execute_and_report(context.bot, user_id, server, f"⭐ {qc['label']}", qc["command"])
+    await _execute_and_report(context.bot, user_id, server, f"✦ {qc['label']}", qc["command"])
 
 
 async def qc_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -525,10 +576,10 @@ async def qc_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     server_id = qc["server_id"] if qc else None
     remove_quick_command(user_id, qc_id)
     if not server_id:
-        await query.edit_message_text("🗑 Removed.")
+        await query.edit_message_text("⌫ Removed.")
         return
     server = settings.get_server(user_id, server_id)
-    text = f"⭐ *Quick Commands — {server['label']}*\n\n🗑 Removed." if server else "🗑 Removed."
+    text = f"✦ *Quick Commands — {server['label']}*\n\n⌫ Removed." if server else "⌫ Removed."
     try:
         await query.edit_message_text(text, reply_markup=_qc_list_keyboard(user_id, server_id), parse_mode="Markdown")
     except BadRequest:
@@ -540,23 +591,23 @@ async def qc_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def _sched_list_keyboard(user_id, server_id):
     keyboard = []
     for j in get_scheduled_jobs(user_id, server_id):
-        onoff = "🟢 ON" if j["enabled"] else "⚪️ OFF"
+        onoff = "● ON" if j["enabled"] else "○ OFF"
         keyboard.append([
             InlineKeyboardButton(f"⏰ {j['hour']:02d}:{j['minute']:02d} — {onoff}", callback_data=f"svauto_sched_toggle_{j['id']}"),
-            InlineKeyboardButton("🗑", callback_data=f"svauto_sched_del_{j['id']}"),
+            InlineKeyboardButton("⌫", callback_data=f"svauto_sched_del_{j['id']}"),
         ])
     max_automations = subscription.get_capabilities(user_id).get("max_automations")
     at_cap = max_automations is not None and len(get_scheduled_jobs(user_id)) >= max_automations
-    add_label = "🔒 Add Schedule (plan limit reached)" if at_cap else "➕ Add Schedule"
+    add_label = "⚿ Add Schedule (plan limit reached)" if at_cap else "+ Add Schedule"
     keyboard.append([InlineKeyboardButton(add_label, callback_data=f"svauto_sched_add_{server_id}")])
-    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data=f"svauto_menu_{server_id}")])
+    keyboard.append([InlineKeyboardButton("← Back", callback_data=f"svauto_menu_{server_id}")])
     return InlineKeyboardMarkup(keyboard)
 
 
 def _sched_text(server, jobs, user_id) -> str:
     lines = []
     for j in jobs:
-        last = f" (last: {'✅' if j['last_ok'] else '❌'} {j['last_run'][:16].replace('T', ' ')})" if j.get("last_run") else ""
+        last = f" (last: {'✓' if j['last_ok'] else '✕'} {j['last_run'][:16].replace('T', ' ')})" if j.get("last_run") else ""
         lines.append(f"• `{j['hour']:02d}:{j['minute']:02d}` — `{j['command']}`{last}")
     max_automations = subscription.get_capabilities(user_id).get("max_automations")
     usage = (
@@ -570,6 +621,12 @@ def _sched_text(server, jobs, user_id) -> str:
     )
 
 
+def _sched_menu_content(user_id, server):
+    server_id = server["id"]
+    jobs = get_scheduled_jobs(user_id, server_id)
+    return _sched_text(server, jobs, user_id), _sched_list_keyboard(user_id, server_id)
+
+
 async def sched_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -577,14 +634,13 @@ async def sched_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = _uid(update)
     server = settings.get_server(user_id, server_id)
     if not server:
-        await query.edit_message_text("❌ Server not found.")
+        await query.edit_message_text("✕ Server not found.")
         return
-    jobs = get_scheduled_jobs(user_id, server_id)
-    text = _sched_text(server, jobs, user_id)
+    text, keyboard = _sched_menu_content(user_id, server)
     try:
-        await query.edit_message_text(text, reply_markup=_sched_list_keyboard(user_id, server_id), parse_mode="Markdown")
+        await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
     except BadRequest:
-        await query.edit_message_text(text, reply_markup=_sched_list_keyboard(user_id, server_id), parse_mode=None)
+        await query.edit_message_text(text, reply_markup=keyboard, parse_mode=None)
 
 
 async def sched_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -594,27 +650,27 @@ async def sched_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     server_id = query.data.replace("svauto_sched_add_", "", 1)
     server = settings.get_server(user_id, server_id)
     if not server:
-        await query.edit_message_text("❌ Server not found.")
+        await query.edit_message_text("✕ Server not found.")
         return ConversationHandler.END
 
     max_automations = subscription.get_capabilities(user_id).get("max_automations")
     if max_automations is not None and len(get_scheduled_jobs(user_id)) >= max_automations:
         await query.answer(
-            f"🔒 Your plan allows {max_automations} automation job(s) max. "
-            "Remove one first, or upgrade from 💳 Subscription.",
+            f"⚿ Your plan allows {max_automations} automation job(s) max. "
+            "Remove one first, or upgrade from ◆ Subscription.",
             show_alert=True,
         )
         return ConversationHandler.END
 
     context.user_data["svauto_tmp"] = {"server_id": server_id}
-    await _edit_then_prompt_cancel(query, f"💻 Send the command to run daily on *{server['label']}*.")
+    await _edit_then_prompt_cancel(query, f"▣ Send the command to run daily on *{server['label']}*.")
     return AUTO_SCHED_ADD_COMMAND
 
 
 async def sched_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if not text:
-        await update.message.reply_text("❌ Please send a command, or tap Cancel.", reply_markup=_cancel_kb())
+        await update.message.reply_text("✕ Please send a command, or tap Cancel.", reply_markup=_cancel_kb())
         return AUTO_SCHED_ADD_COMMAND
     context.user_data.setdefault("svauto_tmp", {})["command"] = text
     await update.message.reply_text(
@@ -635,7 +691,7 @@ async def sched_add_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     if not valid or not server_id or not command:
         await update.message.reply_text(
-            "❌ Please send a valid time as HH:MM (e.g. 03:00), or tap Cancel.", reply_markup=_cancel_kb(),
+            "✕ Please send a valid time as HH:MM (e.g. 03:00), or tap Cancel.", reply_markup=_cancel_kb(),
         )
         return AUTO_SCHED_ADD_TIME
     hour, minute = int(parts[0]), int(parts[1])
@@ -643,9 +699,14 @@ async def sched_add_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     job = add_scheduled_job(user_id, server_id, command, hour, minute)
     schedule_job(context.job_queue, user_id, job)
     context.user_data.pop("svauto_tmp", None)
-    await update.message.reply_text(
-        f"✅ Scheduled daily at `{hour:02d}:{minute:02d}`.", reply_markup=get_main_menu(), parse_mode="Markdown",
-    )
+    server = settings.get_server(user_id, server_id)
+    if not server:
+        await update.message.reply_text(
+            f"✓ Scheduled daily at `{hour:02d}:{minute:02d}`.", reply_markup=get_main_menu(update.effective_user.id), parse_mode="Markdown",
+        )
+        return ConversationHandler.END
+    menu_text, menu_keyboard = _sched_menu_content(user_id, server)
+    await _finish_with_menu(update, f"✓ Scheduled daily at `{hour:02d}:{minute:02d}`.", menu_text, menu_keyboard)
     return ConversationHandler.END
 
 
@@ -655,13 +716,13 @@ async def sched_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = _uid(update)
     job = get_scheduled_job(user_id, job_id)
     if not job:
-        await query.answer("❌ Job not found.")
+        await query.answer("✕ Job not found.")
         return
     new_enabled = not job["enabled"]
     set_scheduled_enabled(user_id, job_id, new_enabled)
     job["enabled"] = new_enabled
     schedule_job(context.job_queue, user_id, job)
-    await query.answer("🟢 Enabled" if new_enabled else "⚪️ Disabled")
+    await query.answer("● Enabled" if new_enabled else "○ Disabled")
     server = settings.get_server(user_id, job["server_id"])
     if not server:
         return
@@ -685,11 +746,11 @@ async def sched_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         unschedule_job(context.job_queue, user_id, job_id)
         remove_scheduled_job(user_id, job_id)
     if not server_id:
-        await query.edit_message_text("🗑 Removed.")
+        await query.edit_message_text("⌫ Removed.")
         return
     server = settings.get_server(user_id, server_id)
     if not server:
-        await query.edit_message_text("🗑 Removed.")
+        await query.edit_message_text("⌫ Removed.")
         return
     jobs = get_scheduled_jobs(user_id, server_id)
     try:
@@ -707,12 +768,12 @@ async def history_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = _uid(update)
     server = settings.get_server(user_id, server_id)
     if not server:
-        await query.edit_message_text("❌ Server not found.")
+        await query.edit_message_text("✕ Server not found.")
         return
     hist = get_history(user_id, server_id, limit=10)
     lines = [f"• `{h['ts'][:16].replace('T', ' ')}` — `{h['command']}`" for h in hist]
-    text = f"📜 *Recent Commands — {server['label']}*\n\n" + ("\n".join(lines) if lines else "No history yet.")
-    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"svauto_menu_{server_id}")]])
+    text = f"▤ *Recent Commands — {server['label']}*\n\n" + ("\n".join(lines) if lines else "No history yet.")
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("← Back", callback_data=f"svauto_menu_{server_id}")]])
     try:
         await query.edit_message_text(text, reply_markup=keyboard, parse_mode="Markdown")
     except BadRequest:

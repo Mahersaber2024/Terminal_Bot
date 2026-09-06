@@ -103,6 +103,7 @@ class Database:
                     sftp_enabled BOOLEAN DEFAULT TRUE,
                     session_timeout_minutes INTEGER,
                     max_automations INTEGER,
+                    advanced_tools_enabled BOOLEAN DEFAULT FALSE,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -117,6 +118,7 @@ class Database:
             cur.execute("ALTER TABLE plans ADD COLUMN IF NOT EXISTS sftp_enabled BOOLEAN DEFAULT TRUE")
             cur.execute("ALTER TABLE plans ADD COLUMN IF NOT EXISTS session_timeout_minutes INTEGER")
             cur.execute("ALTER TABLE plans ADD COLUMN IF NOT EXISTS max_automations INTEGER")
+            cur.execute("ALTER TABLE plans ADD COLUMN IF NOT EXISTS advanced_tools_enabled BOOLEAN DEFAULT FALSE")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS subscriptions (
                     user_id BIGINT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
@@ -127,6 +129,7 @@ class Database:
                     sftp_enabled BOOLEAN DEFAULT TRUE,
                     session_timeout_minutes INTEGER,
                     max_automations INTEGER,
+                    advanced_tools_enabled BOOLEAN DEFAULT FALSE,
                     granted_at TIMESTAMP,
                     expires_at TIMESTAMP
                 )
@@ -134,6 +137,7 @@ class Database:
             cur.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS sftp_enabled BOOLEAN DEFAULT TRUE")
             cur.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS session_timeout_minutes INTEGER")
             cur.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS max_automations INTEGER")
+            cur.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS advanced_tools_enabled BOOLEAN DEFAULT FALSE")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS wallet_transactions (
                     id SERIAL PRIMARY KEY,
@@ -250,6 +254,24 @@ class Database:
         row = self._execute("SELECT is_banned FROM users WHERE user_id = %s", (user_id,), fetch="one")
         return bool(row["is_banned"]) if row else False
 
+    def delete_user(self, user_id) -> bool:
+        """Permanently removes a user from Postgres, along with everything
+        tied to them. subscriptions and wallet_transactions cascade
+        automatically via their ON DELETE CASCADE foreign key; payment_requests
+        has no FK to users (by design, so it can survive as a standalone
+        payments log) so it's cleared explicitly here first. Returns False
+        if the user_id didn't exist. Caller is also responsible for purging
+        that user's ServerManager data (servers, automations), which live
+        outside Postgres - see ServerManager.settings.delete_user_data and
+        ServerManager.automation.delete_user_data."""
+        self._execute("DELETE FROM payment_requests WHERE user_id = %s", (user_id,))
+        row = self._execute(
+            "DELETE FROM users WHERE user_id = %s RETURNING user_id",
+            (user_id,),
+            fetch="one",
+        )
+        return row is not None
+
     # ==================================================================
     # 2. WALLET
     # ==================================================================
@@ -336,28 +358,32 @@ class Database:
 
     def add_plan(self, name: str, price: int, days: int, max_servers: int, max_tabs: int,
                  description: str = "", sftp_enabled: bool = True,
-                 session_timeout_minutes: int = None, max_automations: int = None) -> str:
+                 session_timeout_minutes: int = None, max_automations: int = None,
+                 advanced_tools_enabled: bool = False) -> str:
         """sftp_enabled=False disables the SFTP file browser entirely for
         this plan. session_timeout_minutes/max_automations are None =
         unlimited; pass an int to cap total SSH session length (minutes)
         or the number of scheduled automation jobs a user on this plan
-        may have at once."""
+        may have at once. advanced_tools_enabled gates the remote process
+        manager / systemd / crontab / log-tail toolkit (see
+        ServerManager/handlers.py's Advanced Tools section)."""
         plan_id = uuid.uuid4().hex[:8]
         row = self._execute("SELECT COALESCE(MAX(plan_order), 0) AS m FROM plans", fetch="one")
         order = (row["m"] if row else 0) + 1
         self._execute(
             """INSERT INTO plans (id, name, description, price, days, max_servers, max_tabs, enabled,
-                                   plan_order, sftp_enabled, session_timeout_minutes, max_automations)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE, %s, %s, %s, %s)""",
+                                   plan_order, sftp_enabled, session_timeout_minutes, max_automations,
+                                   advanced_tools_enabled)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE, %s, %s, %s, %s, %s)""",
             (plan_id, name.strip(), (description or "").strip(), int(price), int(days),
              int(max_servers), int(max_tabs), order, bool(sftp_enabled),
-             session_timeout_minutes, max_automations),
+             session_timeout_minutes, max_automations, bool(advanced_tools_enabled)),
         )
         return plan_id
 
     def update_plan(self, plan_id: str, **kwargs) -> bool:
         allowed = {"name", "description", "price", "days", "max_servers", "max_tabs", "enabled",
-                   "sftp_enabled", "session_timeout_minutes", "max_automations"}
+                   "sftp_enabled", "session_timeout_minutes", "max_automations", "advanced_tools_enabled"}
         fields, values = [], []
         for key, value in kwargs.items():
             if key == "order":
@@ -412,10 +438,12 @@ class Database:
             self.add_plan(
                 name="Pro", price=300000, days=30, max_servers=7, max_tabs=4,
                 description="For growing setups: up to 7 servers, 4 terminal sessions at once, health monitoring.",
+                advanced_tools_enabled=True,
             )
             self.add_plan(
                 name="Business", price=500000, days=30, max_servers=15, max_tabs=8,
                 description="For teams: up to 15 servers, 8 terminal sessions at once, priority support.",
+                advanced_tools_enabled=True,
             )
             logger.info("✅ Seeded default plans (Free Basic + Starter/Pro/Business)")
         except Exception as e:
@@ -487,6 +515,7 @@ class Database:
             return {
                 "max_servers": 0, "max_tabs": 0, "sftp_enabled": False,
                 "session_timeout_minutes": 0, "max_automations": 0,
+                "advanced_tools_enabled": False,
             }
         sub = self.get_subscription(user_id)
         return {
@@ -495,24 +524,32 @@ class Database:
             "sftp_enabled": bool(sub.get("sftp_enabled", True)),
             "session_timeout_minutes": sub.get("session_timeout_minutes"),
             "max_automations": sub.get("max_automations"),
+            "advanced_tools_enabled": bool(sub.get("advanced_tools_enabled", False)),
         }
 
-    def grant_subscription(self, user_id, plan: dict) -> dict:
-        """Activates `plan` for the user. Remaining time on an existing
-        active subscription is added on top of the new plan's `days`
-        (renewal/top-up behaviour); enforced limits always switch to the
-        plan just purchased."""
+    def grant_subscription(self, user_id, plan: dict, stack_remaining: bool = True) -> dict:
+        """Activates `plan` for the user. By default (stack_remaining=True)
+        remaining time on an existing active subscription is added on top of
+        the new plan's `days` - this is renewal/top-up behaviour, for a user
+        buying more of the same plan. Pass stack_remaining=False for a plan
+        switch/upgrade where the unused value of the old plan was already
+        credited toward the new plan's price (see subscription._purchase_pricing) -
+        in that case the new plan's full term simply starts now, instead of
+        also stacking the leftover days on top (which would double-count the
+        credit already given). Enforced limits always switch to the plan
+        just purchased."""
         self._ensure_user_row(user_id)
         now = datetime.now()
         base = now
-        existing = self.get_subscription(user_id)
-        if existing and existing.get("expires_at"):
-            try:
-                current_expiry = datetime.fromisoformat(existing["expires_at"])
-                if current_expiry > now:
-                    base = current_expiry
-            except Exception:
-                pass
+        if stack_remaining:
+            existing = self.get_subscription(user_id)
+            if existing and existing.get("expires_at"):
+                try:
+                    current_expiry = datetime.fromisoformat(existing["expires_at"])
+                    if current_expiry > now:
+                        base = current_expiry
+                except Exception:
+                    pass
 
         expires_at = base + timedelta(days=int(plan["days"]))
 
@@ -520,8 +557,8 @@ class Database:
             """
             INSERT INTO subscriptions (user_id, plan_id, plan_name, max_servers, max_tabs,
                                         sftp_enabled, session_timeout_minutes, max_automations,
-                                        granted_at, expires_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                        advanced_tools_enabled, granted_at, expires_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (user_id) DO UPDATE SET
                 plan_id = EXCLUDED.plan_id,
                 plan_name = EXCLUDED.plan_name,
@@ -530,12 +567,13 @@ class Database:
                 sftp_enabled = EXCLUDED.sftp_enabled,
                 session_timeout_minutes = EXCLUDED.session_timeout_minutes,
                 max_automations = EXCLUDED.max_automations,
+                advanced_tools_enabled = EXCLUDED.advanced_tools_enabled,
                 granted_at = EXCLUDED.granted_at,
                 expires_at = EXCLUDED.expires_at
             """,
             (user_id, plan["id"], plan["name"], int(plan["max_servers"]), int(plan["max_tabs"]),
              bool(plan.get("sftp_enabled", True)), plan.get("session_timeout_minutes"),
-             plan.get("max_automations"), now, expires_at),
+             plan.get("max_automations"), bool(plan.get("advanced_tools_enabled", False)), now, expires_at),
         )
         return self.get_subscription(user_id)
 
