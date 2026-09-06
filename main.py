@@ -12,9 +12,15 @@ from telegram.ext import (
     filters,
 )
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _BASE_DIR)
+# backup_manager.py lives in backups/ alongside full_backup.sh /
+# restore_backup.sh, not in the project root - add it to sys.path too so
+# `import backup_manager` resolves no matter which module imports it.
+sys.path.insert(0, os.path.join(_BASE_DIR, "backups"))
 
 from admin import admin
+import backup_manager
 import bot_settings
 import config
 import crypto_utils
@@ -305,6 +311,22 @@ def main():
         fallbacks=[CommandHandler("cancel", admin.admin_cancel), admin_cancel_button],
     )
     application.add_handler(admin_botname_set_conv)
+
+    # ====================== Admin: Backup ======================
+    application.add_handler(CallbackQueryHandler(admin.admin_backup_menu, pattern="^admin_backup_menu$"))
+    application.add_handler(CallbackQueryHandler(admin.admin_backup_now, pattern="^admin_backup_now$"))
+
+    admin_backup_interval_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin.admin_backup_interval_start, pattern="^admin_backup_interval$")],
+        states={
+            admin.ADMIN_BACKUP_INTERVAL: [
+                admin_cancel_button,
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin.admin_backup_interval_input),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", admin.admin_cancel), admin_cancel_button],
+    )
+    application.add_handler(admin_backup_interval_conv)
 
     # ====================== Admin: Manage Users ======================
     application.add_handler(CallbackQueryHandler(admin.admin_users_menu, pattern="^admin_users_menu$"))
@@ -971,6 +993,13 @@ def main():
             f"or tune these from /admin → ✚ Monitoring Settings."
         )
         svm_auto.register_all_jobs(application.job_queue)
+
+        backup_manager.reschedule_job(application.job_queue)
+        print(
+            f"🗄 Automatic backups active - every {bot_settings.get_backup_interval_days()}d, sent to the "
+            f"log group's 🗄 Backups topic and removed from the server right after. Tune this from "
+            f"/admin → 🗄 Backup."
+        )
 
         proxy_candidates = proxy_utils.get_proxy_candidates()
         if proxy_candidates:

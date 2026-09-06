@@ -10,6 +10,9 @@
 #     passwords/private keys)
 #   - bot_settings.json (sponsor channel list, payment card info,
 #     health-monitor thresholds)
+#   - topics_state.json (logger_bot.py's log-group topic thread-id map -
+#     without this, a restore loses track of existing topics and the bot
+#     will try to recreate them on next startup)
 #   - ServerManager/ local data: server_manager_settings.json
 #     (encrypted SSH server credentials), server_manager_automation.json
 #     (automation rules), known_hosts.json
@@ -108,7 +111,7 @@ PGPASSWORD="$DB_PASS" pg_dump -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" \
 # ---------- 3) Root-level config files ----------
 info "Copying configuration files ..."
 mkdir -p "${STAGE_DIR}/root_files"
-for f in .env bot_settings.json requirements.txt; do
+for f in .env bot_settings.json topics_state.json requirements.txt; do
   if [[ -f "${INSTALL_DIR}/${f}" ]]; then
     cp -p "${INSTALL_DIR}/${f}" "${STAGE_DIR}/root_files/"
     ok "Copied: $f"

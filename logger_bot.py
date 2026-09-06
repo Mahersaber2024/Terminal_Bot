@@ -44,6 +44,7 @@ class Topics:
     SUBSCRIPTION_EXPIRE = 35  # Subscription expiry
     SYSTEM_ERROR = 36       # System errors
     USER_ACTIVITY = 37      # General user activity
+    BACKUP = 38             # Full backup archives (see backup_manager.py)
 
 
 TOPIC_NAMES = {
@@ -55,6 +56,7 @@ TOPIC_NAMES = {
     Topics.SUBSCRIPTION_EXPIRE: "⏰ Subscription Expiry",
     Topics.SYSTEM_ERROR: "💥 System Errors",
     Topics.USER_ACTIVITY: "🔄 User Activity",
+    Topics.BACKUP: "🗄 Backups",
 }
 
 

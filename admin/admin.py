@@ -30,6 +30,7 @@ from telegram.ext import (
 )
 
 import bot_settings
+import backup_manager
 import config
 import subscription
 import logger_bot
@@ -75,6 +76,7 @@ ADMIN_OWNERSRV_TZ = 28
 ADMIN_OWNERSRV_QUICKADD_LABEL, ADMIN_OWNERSRV_QUICKADD_CMD = 29, 30
 ADMIN_LOGGROUP_SET = 31
 ADMIN_BOTNAME_SET = 32
+ADMIN_BACKUP_INTERVAL = 33
 USERS_PAGE_SIZE = 10
 
 OWNERSRV_FILES_START_CB = "admin_ownersrv_files"
@@ -449,6 +451,103 @@ async def admin_botname_set_input(update: Update, context: ContextTypes.DEFAULT_
     return ConversationHandler.END
 
 
+def _backup_text_and_keyboard(status_line: str = None):
+    interval = bot_settings.get_backup_interval_days()
+    last_at_raw = bot_settings.get_last_backup_at()
+    if last_at_raw:
+        try:
+            from datetime import datetime as _dt
+            last_at = _dt.fromisoformat(last_at_raw).strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            last_at = last_at_raw
+    else:
+        last_at = "never"
+
+    text = (
+        f"🗄 *Backup Settings*\n\n"
+        f"Periodic backup: every {interval} day(s)\n"
+        f"Last backup: {last_at}\n\n"
+        f"A backup includes the full database, bot settings, and "
+        f"ServerManager data (encrypted server credentials, automation "
+        f"rules). It's sent as a file to the 🗄 Backups topic in the log "
+        f"group and then removed from the server - Telegram is the only "
+        f"place it's kept."
+    )
+    if not bot_settings.get_log_group_id():
+        text += "\n\n⚠ No log group is set yet - set one first (▤ Log Group) or backups have nowhere to go."
+    if status_line:
+        text += f"\n\n{status_line}"
+
+    keyboard = [
+        [InlineKeyboardButton("▶ Backup Now", callback_data="admin_backup_now")],
+        [InlineKeyboardButton(f"⏱ Interval: Every {interval}d (tap to change)", callback_data="admin_backup_interval")],
+        [InlineKeyboardButton("← Back", callback_data="admin_back_to_main")],
+    ]
+    return text, InlineKeyboardMarkup(keyboard)
+
+
+async def admin_backup_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        await query.edit_message_text("⊘ You do not have admin access.")
+        return
+    text, reply_markup = _backup_text_and_keyboard()
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+
+
+async def admin_backup_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_admin(query.from_user.id):
+        await query.answer("⊘ You do not have admin access.", show_alert=True)
+        return
+    await query.answer("⏳ Building backup...")
+    try:
+        await query.edit_message_text("⏳ Building backup - this can take a moment for larger databases...")
+    except BadRequest:
+        pass
+
+    result = await backup_manager.run_backup_and_send(context.bot)
+    logger.info(f"Admin {query.from_user.id} triggered a manual backup: {result}")
+
+    text, reply_markup = _backup_text_and_keyboard(result)
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+
+
+async def admin_backup_interval_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        await query.edit_message_text("⊘ You do not have admin access.")
+        return ConversationHandler.END
+    current = bot_settings.get_backup_interval_days()
+    await _edit_then_prompt_cancel(
+        query, f"✎ Send the new backup interval in days (current: {current}), e.g. \"3\"."
+    )
+    return ADMIN_BACKUP_INTERVAL
+
+
+async def admin_backup_interval_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    try:
+        value = int(text)
+        if value < 1:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text(
+            "✕ Please send a whole number of days, 1 or more, or tap Cancel.",
+            reply_markup=_cancel_kb(),
+        )
+        return ADMIN_BACKUP_INTERVAL
+
+    backup_manager.reschedule_job(context.job_queue, value)
+    logger.info(f"Admin {update.effective_user.id} set backup_interval_days={value}")
+
+    menu_text, menu_keyboard = _backup_text_and_keyboard(f"✓ Backup interval set to every {value} day(s).")
+    await update.message.reply_text(menu_text, reply_markup=menu_keyboard, parse_mode="Markdown")
+    return ConversationHandler.END
+
+
 BANNED_MESSAGE = "⊘ You have been banned from using this bot."
 
 
@@ -580,6 +679,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("✚ Monitoring Settings", callback_data="admin_monitoring_settings")],
         [InlineKeyboardButton("▣ Owner Server (Host)", callback_data="admin_ownersrv_menu")],
         [InlineKeyboardButton("▤ Log Group", callback_data="admin_loggroup_menu")],
+        [InlineKeyboardButton("🗄 Backup", callback_data="admin_backup_menu")],
     ]
     await update.message.reply_text(
         "⚙ Admin Panel\n\nPlease select an option:",
@@ -659,6 +759,7 @@ async def admin_back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE)
         [InlineKeyboardButton("✚ Monitoring Settings", callback_data="admin_monitoring_settings")],
         [InlineKeyboardButton("▣ Owner Server (Host)", callback_data="admin_ownersrv_menu")],
         [InlineKeyboardButton("▤ Log Group", callback_data="admin_loggroup_menu")],
+        [InlineKeyboardButton("🗄 Backup", callback_data="admin_backup_menu")],
     ]
     await query.edit_message_text(
         "⚙ Admin Panel\n\nPlease select an option:",

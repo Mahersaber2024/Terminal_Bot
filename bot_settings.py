@@ -71,6 +71,16 @@ def _seed_defaults() -> dict:
         # logger_bot.py's _topic_display_name), e.g. "New Users(Terminal Bot)".
         # Defaults to "Terminal Bot"; changeable via the "▤ Log Group" admin menu.
         "bot_name": "Terminal Bot",
+        # ====================== Full backup settings ======================
+        # How often the automatic full-backup job (see backup_manager.py and
+        # main.py's job-queue wiring) runs, in days. Changeable from the
+        # admin panel's "🗄 Backup" menu; changing it also reschedules the
+        # background job (see backup_manager.reschedule_job()).
+        "backup_interval_days": int(os.getenv("BACKUP_INTERVAL_DAYS", "3")),
+        # ISO-8601 UTC timestamp of the last successfully-sent backup (manual
+        # or automatic). None until the first backup is sent. Purely
+        # informational - shown in the "🗄 Backup" menu.
+        "last_backup_at": None,
     }
 
 
@@ -104,6 +114,8 @@ def _load() -> dict:
     data.setdefault("owner_quick_commands", [])
     data.setdefault("log_group_id", None)
     data.setdefault("bot_name", "Terminal Bot")
+    data.setdefault("backup_interval_days", int(os.getenv("BACKUP_INTERVAL_DAYS", "3")))
+    data.setdefault("last_backup_at", None)
     _cache = data
     return data
 
@@ -344,4 +356,32 @@ def get_bot_name() -> str:
 def set_bot_name(value: str):
     data = _load()
     data["bot_name"] = (value or "").strip()
+    _save(data)
+
+
+# ====================== Full backup settings (backup_manager.py) ======================
+# Interval (days) between automatic full backups, and when the last one was
+# successfully sent. Editable from the admin panel's "🗄 Backup" menu -
+# changing the interval also reschedules the background job, see
+# backup_manager.reschedule_job().
+
+def get_backup_interval_days() -> int:
+    return int(_load().get("backup_interval_days", 3))
+
+
+def set_backup_interval_days(value: int):
+    data = _load()
+    data["backup_interval_days"] = int(value)
+    _save(data)
+
+
+def get_last_backup_at():
+    """Returns an ISO-8601 UTC timestamp string, or None if no backup has
+    ever been sent yet."""
+    return _load().get("last_backup_at")
+
+
+def set_last_backup_at(value: str):
+    data = _load()
+    data["last_backup_at"] = value
     _save(data)
