@@ -113,18 +113,26 @@ def _format_size(num_bytes: int) -> str:
 
 
 def _restore_guide_text(archive_name: str) -> str:
+    # Commands go inside ```...``` code blocks (Telegram Markdown) so
+    # clients render them as monospace and offer tap-to-copy, instead of
+    # the old plain-text lines that had to be selected by hand.
     return (
-        "📋 How to restore this backup\n\n"
-        "1) Install the bot on the target server first (skip this if it's "
-        "already installed there):\n"
-        "   bash <(curl -fsSL https://raw.githubusercontent.com/Mahersaber2024/Terminal_Bot/main/install.sh)\n\n"
-        f"2) Copy this archive ({archive_name}) to that server, e.g. into /root/.\n\n"
-        "3) Run:\n"
-        f"   cd {INSTALL_DIR}/backups\n"
-        f"   sudo bash restore_backup.sh /root/{archive_name} {INSTALL_DIR}\n\n"
-        "This restores .env, bot_settings.json, ServerManager data, and the "
-        "database, then restarts the service automatically. Full details are "
-        "also inside the archive as BACKUP_INFO.txt."
+        "📋 *How to restore this backup*\n\n"
+        "1\\) Install the bot on the target server first \\(skip this if "
+        "it's already installed there\\):\n"
+        "```\n"
+        "bash <(curl -fsSL https://raw.githubusercontent.com/Mahersaber2024/Terminal_Bot/main/install.sh)\n"
+        "```\n"
+        f"2\\) Copy this archive \\(`{archive_name}`\\) to that server, e\\.g\\. into /root/\\.\n\n"
+        "3\\) Run:\n"
+        "```\n"
+        f"cd {INSTALL_DIR}/backups\n"
+        f"sudo bash restore_backup.sh /root/{archive_name} {INSTALL_DIR}\n"
+        "```\n"
+        "This restores `.env`, `bot_settings.json`, `topics_state.json`, "
+        "ServerManager data, and the database, then restarts the service "
+        "automatically\\. Full details are also inside the archive as "
+        "`BACKUP_INFO.txt`\\."
     )
 
 
@@ -174,6 +182,7 @@ async def run_backup_and_send(bot, chat_id: int = None) -> str:
                     chat_id=target_chat,
                     text=_restore_guide_text(archive_name),
                     message_thread_id=thread_id,
+                    parse_mode="MarkdownV2",
                 )
             except Exception as e:
                 logger.warning(f"Backup file sent, but the restore-guide message failed: {e}")
