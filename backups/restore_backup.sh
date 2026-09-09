@@ -76,8 +76,13 @@ if [[ -d "${STAGE_DIR}/root_files" ]]; then
   # (no dotglob), so we copy known filenames explicitly instead of
   # relying on a glob - that silent gap previously left .env un-restored
   # even though this step reported success.
+  #
+  # topics_state.json must be in this list too: full_backup.sh already
+  # copies it into root_files/, but it was missing here, so a restore
+  # silently dropped it and the bot then treated every log-group topic
+  # as new on next startup and recreated them all.
   RESTORED_ANY=0
-  for f in .env bot_settings.json requirements.txt; do
+  for f in .env bot_settings.json topics_state.json requirements.txt; do
     SRC="${STAGE_DIR}/root_files/${f}"
     if [[ -f "$SRC" ]]; then
       if cp -p "$SRC" "${INSTALL_DIR}/${f}"; then
